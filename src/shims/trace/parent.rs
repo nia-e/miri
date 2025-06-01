@@ -347,7 +347,8 @@ fn wait_for_signal(
     }
     // Repeatedly call `waitid` until we get the signal we want, or the process dies
     loop {
-        let stat = wait::waitid(wait::Id::Pid(pid), WAIT_FLAGS).map_err(|_| ExecError::Shrug)?;
+        let stat =
+            wait::waitid(wait::Id::Pid(pid), WAIT_FLAGS).map_err(|_| ExecError::Died(None))?;
         let signal = match stat {
             // Report the cause of death, if we know it
             wait::WaitStatus::Exited(_, code) => {
@@ -367,10 +368,7 @@ fn wait_for_signal(
         if signal == wait_signal {
             break;
         } else {
-            match ptrace::cont(pid, None) {
-                Ok(_) => (),
-                Err(_) => return Err(ExecError::Shrug),
-            }
+            ptrace::cont(pid, None).map_err(|_| ExecError::Died(None))?;
         }
     }
     Ok(())
