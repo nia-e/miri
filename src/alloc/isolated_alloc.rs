@@ -283,7 +283,7 @@ impl IsolatedAlloc {
         pages
     }
 
-    /// Protects all owned memory as `PROT_NONE`, preventing accesses.
+    /// Protects all owned memory, preventing accesses.
     ///
     /// SAFETY: Accessing memory after this point will result in a segfault
     /// unless it is first unprotected.

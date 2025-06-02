@@ -4,13 +4,28 @@ use ipc_channel::ipc;
 use nix::sys::{ptrace, signal, wait};
 use nix::unistd;
 
-use crate::shims::trace::{AccessEvent, FAKE_STACK_SIZE, MemEvents, StartFfiInfo, TraceRequest};
+use crate::shims::trace::{
+    AccessEvent, FAKE_STACK_SIZE, LibcEvent, MemEvents, MmapEvent, StartFfiInfo, TraceRequest,
+};
 
 /// The flags to use when calling `waitid()`.
 /// Since bitwise or on the nix version of these flags is implemented as a trait,
-/// this cannot be const directly so we do it this way
+/// this cannot be const directly so we do it this way.
 const WAIT_FLAGS: wait::WaitPidFlag =
     wait::WaitPidFlag::from_bits_truncate(libc::WUNTRACED | libc::WEXITED);
+
+/// Opcode for an instruction to raise SIGTRAP, to be written in the child process.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const BREAKPT_INSTR: isize = 0xCC;
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+const BREAKPT_INSTR: isize = 0xD420;
+// FIXME: riscv!
+
+/// The size of the breakpoint-triggering instruction, in bytes.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const BREAKPT_INSTR_SIZE: usize = 1;
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+const BREAKPT_INSTR_SIZE: usize = 4;
 
 /// Arch-specific maximum size a single access might perform. x86 value is set
 /// assuming nothing bigger than AVX-512 is available.
@@ -41,8 +56,20 @@ static PAGE_COUNT: AtomicUsize = AtomicUsize::new(1);
 /// consist of functions with a small number of register-sized integer arguments.
 /// See <https://man7.org/linux/man-pages/man2/syscall.2.html> for sources
 trait ArchIndependentRegs {
-    /// Gets the address of the instruction pointer.
+    /// The return value of a function call, if one just happened. All of our
+    /// uses of it involve this being signed, so return it as such.
+    fn retval(&self) -> isize;
+    /// The first ptr-sized argument.
+    fn arg1(&self) -> usize;
+    /// The second ptr-sized argument.
+    fn arg2(&self) -> usize;
+    /// If entering a syscall, this is the syscall number. `libc` has this as
+    /// a signed integer, so return it that way here also.
+    fn syscall_nr(&self) -> isize;
+    /// The instruction pointer.
     fn ip(&self) -> usize;
+    /// The stack pointer.
+    fn sp(&self) -> usize;
     /// Set the instruction pointer; remember to also set the stack pointer, or
     /// else the stack might get messed up!
     fn set_ip(&mut self, ip: usize);
@@ -56,7 +83,12 @@ trait ArchIndependentRegs {
 #[expect(clippy::as_conversions)]
 #[rustfmt::skip]
 impl ArchIndependentRegs for libc::user_regs_struct {
+    fn retval(&self) -> isize { self.rax as _ }
+    fn arg1(&self) -> usize { self.rdi as _ }
+    fn arg2(&self) -> usize { self.rsi as _ }
+    fn syscall_nr(&self) -> isize { self.orig_rax as _ }
     fn ip(&self) -> usize { self.rip as _ }
+    fn sp(&self) -> usize { self.rsp as _ }
     fn set_ip(&mut self, ip: usize) { self.rip = ip as _ }
     fn set_sp(&mut self, sp: usize) { self.rsp = sp as _ }
 }
@@ -65,7 +97,12 @@ impl ArchIndependentRegs for libc::user_regs_struct {
 #[expect(clippy::as_conversions)]
 #[rustfmt::skip]
 impl ArchIndependentRegs for libc::user_regs_struct {
+    fn retval(&self) -> isize { self.eax as _ }
+    fn arg1(&self) -> usize { self.edi as _ }
+    fn arg2(&self) -> usize { self.esi as _ }
+    fn syscall_nr(&self) -> isize { self.orig_eax as _ }
     fn ip(&self) -> usize { self.eip as _ }
+    fn sp(&self) -> usize { self.esp as _ }
     fn set_ip(&mut self, ip: usize) { self.eip = ip as _ }
     fn set_sp(&mut self, sp: usize) { self.esp = sp as _ }
 }
@@ -74,7 +111,12 @@ impl ArchIndependentRegs for libc::user_regs_struct {
 #[expect(clippy::as_conversions)]
 #[rustfmt::skip]
 impl ArchIndependentRegs for libc::user_regs_struct {
+    fn retval(&self) -> isize { self.regs[0] as _ }
+    fn arg1(&self) -> usize { self.regs[0] as _ }
+    fn arg2(&self) -> usize { self.regs[1] as _ }
+    fn syscall_nr(&self) -> isize { self.regs[8] as _ }
     fn ip(&self) -> usize { self.pc as _ }
+    fn sp(&self) -> usize { self.sp as _ }
     fn set_ip(&mut self, ip: usize) { self.pc = ip as _ }
     fn set_sp(&mut self, sp: usize) { self.sp = sp as _ }
 }
@@ -213,6 +255,83 @@ impl Iterator for ChildListener {
     }
 }
 
+/// Values needed for us to intercept calls to certain libc functions, such as
+/// their addresses and original content (before we overwrote them).
+#[derive(Clone, Copy)]
+struct MagicLibcValues {
+    /// The address at which `libc::malloc()` begins in memory.
+    malloc_addr: usize,
+    /// The address at which `libc::realloc()` begins in memory.
+    realloc_addr: usize,
+    /// The address at which `libc::free()` begins in memory.
+    free_addr: usize,
+    /// The first word of machine code in `libc::malloc()`.
+    malloc_bytes: isize,
+    /// The first word of machine code in `libc::realloc()`.
+    free_bytes: isize,
+    /// The first word of machine code in `libc::free()`.
+    realloc_bytes: isize,
+}
+
+impl MagicLibcValues {
+    /// Gets the needed values. Note that while safe to do after, this should
+    /// be done *before* anything is overwritten with `raise(SIGTRAP)`s.
+    /// 
+    /// While `ptrace::{read, write}` say they need an i64/i32, it's actually
+    /// just an `isize` since it depends on the platform.
+    #[expect(clippy::as_conversions)]
+    fn read() -> Self {
+        // No other real way to do this
+        let malloc_addr = libc::malloc as usize;
+        let realloc_addr = libc::realloc as usize;
+        let free_addr = libc::free as usize;
+        Self {
+            malloc_addr,
+            realloc_addr,
+            free_addr,
+            // I'm sorry...
+            // SAFETY: These are all functions that are known to exist if libc
+            // is linked against, and they are larger than 8 bytes.
+            malloc_bytes: unsafe {
+                std::ptr::with_exposed_provenance::<isize>(malloc_addr).read_volatile()
+            },
+            realloc_bytes: unsafe {
+                std::ptr::with_exposed_provenance::<isize>(realloc_addr).read_volatile()
+            },
+            free_bytes: unsafe {
+                std::ptr::with_exposed_provenance::<isize>(free_addr).read_volatile()
+            },
+        }
+    }
+
+    /// Restores the data at the start of the stored functions to its original
+    /// contents on the child process.
+    #[expect(clippy::as_conversions)]
+    fn restore(&self, pid: unistd::Pid) -> Result<(), nix::errno::Errno> {
+        ptrace::write(
+            pid,
+            std::ptr::with_exposed_provenance_mut(self.malloc_addr),
+            self.malloc_bytes as _,
+        )?;
+        ptrace::write(
+            pid,
+            std::ptr::with_exposed_provenance_mut(self.realloc_addr),
+            self.realloc_bytes as _,
+        )?;
+        ptrace::write(pid, std::ptr::with_exposed_provenance_mut(self.free_addr), self.free_bytes as _)
+    }
+
+    /// Overwrites the first 8 bytes of the `_addr` fields with the specified
+    /// data, in the child process. `data` should probably be some kind of
+    /// breakpoint/SIGTRAP instruction.
+    #[expect(clippy::as_conversions)]
+    fn overwrite_all(&self, pid: unistd::Pid, data: isize) -> Result<(), nix::errno::Errno> {
+        ptrace::write(pid, std::ptr::with_exposed_provenance_mut(self.malloc_addr), data as _)?;
+        ptrace::write(pid, std::ptr::with_exposed_provenance_mut(self.realloc_addr), data as _)?;
+        ptrace::write(pid, std::ptr::with_exposed_provenance_mut(self.free_addr), data as _)
+    }
+}
+
 /// An error came up while waiting on the child process to do something.
 #[derive(Debug)]
 enum ExecError {
@@ -233,10 +352,15 @@ pub fn sv_loop(
 ) -> Result<!, Option<i32>> {
     // Things that we return to the child process
     let mut acc_events = Vec::new();
+    let mut mmap_events = Vec::new();
+    let mut libc_events = Vec::new();
 
     // Memory allocated on the MiriMachine
     let mut ch_pages = Vec::new();
     let mut ch_stack = None;
+
+    // Bits needed to intercept libc calls that we care about
+    let libc_vals = MagicLibcValues::read();
 
     // An instance of the Capstone disassembler, so we don't spawn one on every access
     let cs = get_disasm();
@@ -270,18 +394,31 @@ pub fn sv_loop(
                 confirm_tx.send(()).unwrap();
                 wait_for_signal(main_pid, signal::SIGSTOP, false).unwrap();
 
+                // Now overwrite the libc bits we care about monitoring, and tell the child
+                // to continue (and begin the real FFI call)
+                libc_vals.overwrite_all(main_pid, BREAKPT_INSTR).unwrap();
                 ptrace::syscall(main_pid, None).unwrap();
             }
             // end_ffi was called by the child
             ExecEvent::End => {
                 // Hand over the access info we traced
                 event_tx
-                    .send(MemEvents { acc_events, alloc_cutoff: page_size })
+                    .send(MemEvents {
+                        acc_events,
+                        alloc_cutoff: page_size,
+                        mmap_events,
+                        libc_events,
+                    })
                     .unwrap();
                 // And reset our values
                 acc_events = Vec::new();
+                mmap_events = Vec::new();
+                libc_events = Vec::new();
                 ch_stack = None;
 
+                // Child is already stopped, since it raised SIGUSR1, so we don't
+                // need to wait on anything
+                libc_vals.restore(main_pid).unwrap();
                 // No need to monitor syscalls anymore, they'd just be ignored
                 ptrace::cont(main_pid, None).unwrap();
             }
@@ -306,6 +443,17 @@ pub fn sv_loop(
                                 },
                             _ => (),
                         },
+                    // Most likely triggered by the child touching the libc bits
+                    // we made trap, so handle that
+                    signal::SIGTRAP =>
+                        match handle_sigtrap(pid, &mut libc_events, libc_vals) {
+                            Err(e) =>
+                                match e {
+                                    ExecError::Died(code) => return Err(code),
+                                    ExecError::Shrug => continue,
+                                },
+                            _ => (),
+                        },
                     // Something weird happened
                     _ => {
                         eprintln!("Process unexpectedly got {signal}; continuing...");
@@ -320,6 +468,57 @@ pub fn sv_loop(
             // Child entered a syscall; we wait for exits inside of this, so it
             // should never trigger on return from a syscall we care about
             ExecEvent::Syscall(pid) => {
+                let regs = ptrace::getregs(pid).unwrap();
+                // Again, the constants are defined as i64/i32 but they're just isizes
+                #[expect(clippy::as_conversions)]
+                match regs.syscall_nr() as _ {
+                    libc::SYS_mmap => {
+                        // No need for a discrete fn here, it's very tiny.
+                        // The length is guaranteed to be to be a multiple of
+                        // the pagesize anyways so we can just assume it and
+                        // the syscall will error if it's not
+                        let pg_count = regs.arg2().strict_div(page_size);
+                        // Wait for the exit from the call now
+                        let regs = match wait_for_syscall(pid, libc::SYS_mmap as _) {
+                            Ok(regs) => regs,
+                            Err(e) =>
+                                match e {
+                                    ExecError::Died(code) => return Err(code),
+                                    ExecError::Shrug => continue,
+                                },
+                        };
+                        // For mmap, a negative retval is failure, and anything
+                        // else is the address it returned
+                        if let Ok(addr) = usize::try_from(regs.retval()) {
+                            // NB: Don't get rid of munmaps that might have happened,
+                            // since pointers to deallocated memory that "by chance"
+                            // gets reallocated should get invalidated!
+                            for i in 0..pg_count {
+                                mmap_events.push(MmapEvent::Mmap(
+                                    addr.strict_add(i.strict_mul(page_size)),
+                                ));
+                            }
+                        }
+                    }
+                    libc::SYS_munmap => {
+                        // Register unmapping, or remove a mapping. If a mapping
+                        // was entirely transient (i.e. appeared and was deleted
+                        // during the tracing), no need to report it
+                        match handle_munmap(pid, regs, &mut mmap_events, page_size) {
+                            Err(e) =>
+                                match e {
+                                    ExecError::Died(code) => return Err(code),
+                                    ExecError::Shrug => continue,
+                                },
+                            _ => (),
+                        }
+                    }
+                    // TODO: handle brk/sbrk
+                    // or not, using sbrk in 2025 means you deserve UB
+                    // Also maybe intercept/prevent fork() et al.?
+                    _ => (),
+                }
+
                 ptrace::syscall(pid, None).unwrap();
             }
             ExecEvent::Died(code) => {
@@ -391,6 +590,98 @@ fn wait_for_signal(
             ptrace::cont(pid, None).map_err(|_| ExecError::Died(None))?;
         }
     }
+    Ok(())
+}
+
+/// Waits for the child to return from its current syscall, grabbing its registers.
+/// DO NOT call `ptrace::syscall()` right before this!
+fn wait_for_syscall(pid: unistd::Pid, syscall: isize) -> Result<libc::user_regs_struct, ExecError> {
+    // We always want an initial call to this
+    ptrace::syscall(pid, None).unwrap();
+    // There's no way this fails except if the child dies somehow
+    let stat = wait::waitid(wait::Id::Pid(pid), WAIT_FLAGS).map_err(|_| ExecError::Died(None))?;
+    match stat {
+        // Again, report back death
+        wait::WaitStatus::Exited(_, code) => {
+            //eprintln!("Exited sig2 {code}");
+            Err(ExecError::Died(Some(code)))
+        }
+        wait::WaitStatus::Signaled(_, _, _) => Err(ExecError::Died(None)),
+        wait::WaitStatus::PtraceSyscall(pid) => {
+            let regs = ptrace::getregs(pid).unwrap();
+            if regs.syscall_nr() == syscall {
+                Ok(regs)
+            } else {
+                panic!("Missed syscall while waiting for it to return: id {syscall}");
+            }
+        }
+        // Should be impossible, but don't ever deadlock!
+        _ => panic!("Somehow got stopped by signal while inside a syscall?"),
+    }
+}
+
+/// Updates our state as needed following a page unmapping, removing that mapping
+/// from our list if possible or registering it as an unmapping of other memory
+/// otherwise.
+///
+/// TODO: Make this check if the page being unmapped belongs to the MiriMachine,
+/// and determine if that's legal / how to handle it.
+fn handle_munmap(
+    pid: unistd::Pid,
+    regs: libc::user_regs_struct,
+    mmap_events: &mut Vec<MmapEvent>,
+    page_size: usize,
+) -> Result<(), ExecError> {
+    // The unmap call might hit multiple mappings we've saved, so break it up
+    // into individual pages
+    let um_addr = regs.arg1();
+    let um_count = regs.arg2().strict_div(page_size);
+
+    // Indices of mappings we need to remove
+    let mut idxes = vec![];
+    // New unmappings that aren't just unmapping known state
+    let mut to_append = vec![];
+
+    // Iterate through mappings only and update the vecs above as needed
+    for (idx, &mp) in mmap_events
+        .iter()
+        .filter_map(|mp| {
+            match mp {
+                MmapEvent::Mmap(addr) => Some(addr),
+                MmapEvent::Munmap(_) => None,
+            }
+        })
+        .enumerate()
+    {
+        for i in 0..um_count {
+            // Either we're unmapping a page we know about, or this is some new
+            // unmapping we should report back
+            if mp == um_addr.strict_add(i.strict_mul(page_size)) {
+                idxes.push(idx);
+            } else {
+                to_append.push(MmapEvent::Munmap(um_addr.strict_add(i.strict_mul(page_size))));
+            }
+        }
+    }
+
+    #[expect(clippy::as_conversions)]
+    let regs = wait_for_syscall(pid, libc::SYS_munmap as _)?;
+
+    // munmap returns 0 on success
+    if regs.retval() == 0 {
+        // We iterate thru this while removing elements so if
+        // it's not reversed we will mess up the mappings badly!
+        idxes.reverse();
+
+        // Unmap succeeded, so take out the page(s) from our list and push the
+        // new ones. No need to worry about partial unmaps because we only store
+        // individual pages
+        mmap_events.append(&mut to_append);
+        for idx in idxes {
+            mmap_events.remove(idx);
+        }
+    }
+
     Ok(())
 }
 
@@ -679,6 +970,147 @@ fn handle_segfault(
         ptrace::kill(pid).unwrap();
         Err(ExecError::Died(None))
     }
+}
+
+/// Intercept the allocation/deallocation that happened upon calling `malloc`
+/// or similar, logging them down. If the child dies, its return code is returned
+/// as an error.
+fn handle_sigtrap(
+    pid: unistd::Pid,
+    libc_events: &mut Vec<LibcEvent>,
+    libc_vals: MagicLibcValues,
+) -> Result<(), ExecError> {
+    let regs = ptrace::getregs(pid).map_err(|_| ExecError::Shrug)?;
+    // We'll be one instruction past the start
+    match regs.ip().strict_sub(BREAKPT_INSTR_SIZE) {
+        // malloc
+        a if a == libc_vals.malloc_addr => {
+            // Grab the size from registers and save it if the call is successful
+            let size = regs.arg1();
+            if let Ok(ptr) =
+                intercept_retptr(pid, regs, libc_vals.malloc_addr, libc_vals.malloc_bytes)?
+                    .try_into()
+            {
+                libc_events.push(LibcEvent::Malloc(ptr..ptr.strict_add(size)));
+            }
+        }
+        // realloc
+        a if a == libc_vals.realloc_addr => {
+            // Free the old pointer, then mark down the new one
+            let old_ptr = regs.arg1();
+            let size = regs.arg2();
+            // This can only match 1 item, unless malloc itself is misbehaving,
+            // or it will error and this will be discarded
+            let pos = libc_events.iter().position(|rg| {
+                match rg {
+                    // malloc will allow freeing pointers offset from their
+                    // initial address as long as it's in the right range
+                    LibcEvent::Malloc(rg) => rg.start <= old_ptr && old_ptr < rg.end,
+                    LibcEvent::Free(_) => false,
+                }
+            });
+            if let Ok(ptr) =
+                intercept_retptr(pid, regs, libc_vals.realloc_addr, libc_vals.realloc_bytes)?
+                    .try_into()
+            {
+                if let Some(pos) = pos {
+                    // Freeing something we spotted during this run, so just pretend
+                    // it never happened
+                    libc_events.remove(pos);
+                } else {
+                    // Or it's removing a preexisting pointer, so we log this down
+                    libc_events.push(LibcEvent::Free(old_ptr));
+                }
+                // Make sure it's ordered right! This goes at the end
+                libc_events.push(LibcEvent::Malloc(ptr..ptr.strict_add(size)));
+            }
+        }
+        // free
+        a if a == libc_vals.free_addr => {
+            let old_ptr = regs.arg1();
+            let pos = libc_events.iter().position(|rg| {
+                match rg {
+                    LibcEvent::Malloc(rg) => rg.start <= old_ptr && old_ptr < rg.end,
+                    LibcEvent::Free(_) => false,
+                }
+            });
+            // This can lead to double-frees, but that's on the C code...
+            // No real way for us to catch it here
+            if let Some(pos) = pos {
+                // Same as for realloc
+                libc_events.remove(pos);
+            } else {
+                libc_events.push(LibcEvent::Free(old_ptr));
+            }
+            // Return value here doesn't exist, but make sure it doesn't error
+            intercept_retptr(pid, regs, libc_vals.free_addr, libc_vals.free_bytes)?;
+        }
+        // This should almost definitely never happen, but better safe than sorry
+        a => {
+            eprintln!("Process got an unexpected SIGTRAP at addr {a:#018x?}; continuing...");
+            ptrace::syscall(pid, None).unwrap();
+        }
+    }
+
+    Ok(())
+}
+
+/// Gets the pointer or error value returned by the `libc` allocation functions
+/// upon their being called. `fn_addr` should be the address of the respective
+/// function, with `fn_bytes` being the original bytes it held before being
+/// overwritten.
+fn intercept_retptr(
+    pid: unistd::Pid,
+    mut regs: libc::user_regs_struct,
+    fn_addr: usize,
+    fn_bytes: isize,
+) -> Result<isize, ExecError> {
+    // Outline:
+    // - Move instr ptr back before the sigtrap happened
+    // - Restore the function to what it's supposed to be
+    // - Change the function we're returning to so it gives us a sigtrap
+    // - Catch it there
+    // - Get the register-sized return value
+    // - Patch the function back so it traps as before
+    regs.set_ip(regs.ip().strict_sub(BREAKPT_INSTR_SIZE));
+    // Just need to keep the same bit pattern
+    #[expect(clippy::as_conversions)]
+    let ret_addr = ptrace::read(pid, std::ptr::without_provenance_mut(regs.sp()))
+        .map_err(|_| ExecError::Shrug)? as usize;
+    let ret_bytes = ptrace::read(pid, std::ptr::without_provenance_mut(ret_addr)).unwrap();
+
+    // Write a breakpoint at the return address
+    // TODO: Make this more arch-agnostic
+    ptrace::write(
+        pid,
+        std::ptr::without_provenance_mut(ret_addr),
+        BREAKPT_INSTR.try_into().unwrap(),
+    )
+    .unwrap();
+    // This one we did technically expose provenance for but it's in a different process anyways, so...
+    #[expect(clippy::as_conversions)]
+    ptrace::write(pid, std::ptr::without_provenance_mut(fn_addr), fn_bytes as _).unwrap();
+    ptrace::setregs(pid, regs).unwrap();
+    // Now wait for the function to return
+    wait_for_signal(pid, signal::SIGTRAP, true)?;
+
+    // We're getting the return value here
+    let mut regs = ptrace::getregs(pid).unwrap();
+    let ptr = regs.retval();
+    regs.set_ip(regs.ip().strict_sub(BREAKPT_INSTR_SIZE));
+    // Re-trap on allocation functions
+    ptrace::write(
+        pid,
+        std::ptr::without_provenance_mut(fn_addr),
+        BREAKPT_INSTR.try_into().unwrap(),
+    )
+    .unwrap();
+    // And fix up the code we returned into
+    ptrace::write(pid, std::ptr::without_provenance_mut(ret_addr), ret_bytes).unwrap();
+    ptrace::setregs(pid, regs).unwrap();
+
+    ptrace::syscall(pid, None).unwrap();
+    Ok(ptr)
 }
 
 // We only get dropped into these functions via offsetting the instr pointer

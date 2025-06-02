@@ -1,7 +1,6 @@
 #![warn(clippy::arithmetic_side_effects)]
 
 mod aarch64;
-mod alloc;
 mod backtrace;
 mod files;
 #[cfg(unix)]
@@ -11,6 +10,7 @@ mod wasi;
 mod windows;
 mod x86;
 
+pub mod alloc;
 pub mod env;
 pub mod extern_static;
 pub mod foreign_items;

@@ -16,6 +16,27 @@ pub enum MiriAllocParams {
     Global,
     #[cfg(target_os = "linux")]
     Isolated(Rc<RefCell<IsolatedAlloc>>),
+    #[cfg(target_os = "linux")]
+    Foreign(Rc<RefCell<IsolatedAlloc>>, *mut u8),
+}
+
+#[derive(Clone, Debug)]
+enum MiriDropParams {
+    Global,
+    #[cfg(target_os = "linux")]
+    Isolated(Rc<RefCell<IsolatedAlloc>>),
+    #[cfg(target_os = "linux")]
+    Leak(Rc<RefCell<IsolatedAlloc>>),
+}
+
+impl From<MiriAllocParams> for MiriDropParams {
+    fn from(value: MiriAllocParams) -> Self {
+        match value {
+            MiriAllocParams::Global => MiriDropParams::Global,
+            MiriAllocParams::Isolated(ref_cell) => MiriDropParams::Isolated(ref_cell),
+            MiriAllocParams::Foreign(ref_cell, _) => MiriDropParams::Leak(ref_cell),
+        }
+    }
 }
 
 /// Allocation bytes that explicitly handle the layout of the data they're storing.
@@ -29,16 +50,24 @@ pub struct MiriAllocBytes {
     /// * If `self.layout.size() == 0`, then `self.ptr` was allocated with the equivalent layout with size 1.
     /// * Otherwise, `self.ptr` points to memory allocated with `self.layout`.
     ptr: *mut u8,
-    /// Whether this instance of `MiriAllocBytes` had its allocation created by calling `alloc::alloc()`
-    /// (`Global`) or the discrete allocator (`Isolated`)
-    params: MiriAllocParams,
+    /// Parmeters describing what to do with the memory upon the `MiriAllocBytes`
+    /// being dropped.
+    params: MiriDropParams,
 }
 
 impl Clone for MiriAllocBytes {
     fn clone(&self) -> Self {
         let bytes: Cow<'_, [u8]> = Cow::Borrowed(self);
         let align = Align::from_bytes(self.layout.align().to_u64()).unwrap();
-        MiriAllocBytes::from_bytes(bytes, align, self.params.clone())
+        MiriAllocBytes::from_bytes(
+            bytes,
+            align,
+            match self.params.clone() {
+                MiriDropParams::Global => MiriAllocParams::Global,
+                MiriDropParams::Isolated(ref_cell) => MiriAllocParams::Isolated(ref_cell),
+                MiriDropParams::Leak(ref_cell) => MiriAllocParams::Isolated(ref_cell),
+            },
+        )
     }
 }
 
@@ -55,10 +84,12 @@ impl Drop for MiriAllocBytes {
         // SAFETY: Invariant, `self.ptr` points to memory allocated with `self.layout`.
         unsafe {
             match self.params.clone() {
-                MiriAllocParams::Global => alloc::dealloc(self.ptr, alloc_layout),
+                MiriDropParams::Global => alloc::dealloc(self.ptr, alloc_layout),
                 #[cfg(target_os = "linux")]
-                MiriAllocParams::Isolated(alloc) =>
+                MiriDropParams::Isolated(alloc) =>
                     alloc.borrow_mut().dealloc(self.ptr, alloc_layout),
+                #[cfg(target_os = "linux")]
+                MiriDropParams::Leak(_) => (), // Do nothing
             }
         }
     }
@@ -103,7 +134,7 @@ impl MiriAllocBytes {
             Err(())
         } else {
             // SAFETY: All `MiriAllocBytes` invariants are fulfilled.
-            Ok(Self { ptr, layout, params })
+            Ok(Self { ptr, layout, params: params.into() })
         }
     }
 }
@@ -119,12 +150,17 @@ impl AllocBytes for MiriAllocBytes {
         let slice = slice.into();
         let size = slice.len();
         let align = align.bytes();
+        // Whether to not actually initialise the alloc because we're using the
+        // AllocParams to sneak in a foreign (initialised) allocation
+        let phony = matches!(params, MiriAllocParams::Foreign(_, _));
         // SAFETY: `alloc_fn` will only be used with `size != 0`.
         let alloc_fn = |layout, params: &MiriAllocParams| unsafe {
             match params {
                 MiriAllocParams::Global => alloc::alloc(layout),
                 #[cfg(target_os = "linux")]
                 MiriAllocParams::Isolated(alloc) => alloc.borrow_mut().alloc(layout),
+                #[cfg(target_os = "linux")]
+                MiriAllocParams::Foreign(_, ptr) => *ptr,
             }
         };
         let alloc_bytes = MiriAllocBytes::alloc_with(size.to_u64(), align, params, alloc_fn)
@@ -133,7 +169,9 @@ impl AllocBytes for MiriAllocBytes {
             });
         // SAFETY: `alloc_bytes.ptr` and `slice.as_ptr()` are non-null, properly aligned
         // and valid for the `size`-many bytes to be copied.
-        unsafe { alloc_bytes.ptr.copy_from(slice.as_ptr(), size) };
+        if !phony {
+            unsafe { alloc_bytes.ptr.copy_from(slice.as_ptr(), size) };
+        }
         alloc_bytes
     }
 
@@ -146,6 +184,8 @@ impl AllocBytes for MiriAllocBytes {
                 MiriAllocParams::Global => alloc::alloc_zeroed(layout),
                 #[cfg(target_os = "linux")]
                 MiriAllocParams::Isolated(alloc) => alloc.borrow_mut().alloc_zeroed(layout),
+                #[cfg(target_os = "linux")]
+                MiriAllocParams::Foreign(_, ptr) => *ptr,
             }
         };
         MiriAllocBytes::alloc_with(size, align, params, alloc_fn).ok()

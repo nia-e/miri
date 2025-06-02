@@ -487,7 +487,39 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn apply_events(&mut self, events: crate::shims::trace::MemEvents) -> InterpResult<'tcx> {
         use rustc_index::bit_set::DenseBitSet;
 
+        use crate::shims::alloc::EvalContextExt;
+        use crate::shims::trace::LibcEvent;
+
         let this = self.eval_context_mut();
+
+        for malloc in
+            events.libc_events.into_iter().filter(|e| matches!(e, LibcEvent::Malloc(_))).map(|e| {
+                match e {
+                    LibcEvent::Malloc(rg) => rg,
+                    LibcEvent::Free(_) => unreachable!(),
+                }
+            })
+        {
+            use crate::alloc::MiriAllocParams;
+
+            let alloc = match this.machine.get_default_alloc_params() {
+                MiriAllocParams::Isolated(alloc) => alloc,
+                _ => unreachable!(),
+            };
+            let ptr = std::ptr::with_exposed_provenance_mut(malloc.start);
+            let size = malloc.end.strict_sub(malloc.start);
+            let mut slice = Vec::new();
+            slice.extend(std::iter::repeat_n(0, size));
+            let align = this.malloc_align(size.to_u64());
+            let alloc = Allocation::from_bytes(
+                &slice,
+                align,
+                rustc_ast::Mutability::Mut,
+                MiriAllocParams::Foreign(alloc, ptr),
+            );
+            let ptr = this.insert_allocation(alloc, MemoryKind::Machine(MiriMemoryKind::C))?;
+            this.expose_provenance(ptr.provenance)?;
+        }
 
         // In order to not overexpose provenances, we only want to mark as read
         // bytes that were read before being written. That's inefficient to track
@@ -588,7 +620,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let _exposed: Vec<AllocId> =
             this.machine.alloc_addresses.get_mut().exposed.iter().copied().collect();
         interp_ok(())
-        //this.apply_accesses(exposed, events.reads, events.writes)
+        //this.apply_accesses(exposed, reads, writes)
     }
 }
 

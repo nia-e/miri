@@ -197,6 +197,7 @@ pub unsafe fn init_sv() -> Result<(), SvInitError> {
                     // Attach to the child process without stopping it
                     match ptrace::seize(child, options) {
                         // Ptrace works :D
+                        // Ptrace works :D
                         Ok(_) => {
                             let code =
                                 sv_loop(listener, event_tx, confirm_tx, page_size).unwrap_err();

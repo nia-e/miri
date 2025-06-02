@@ -86,6 +86,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
 
             // Old-style intrinsics that have the ordering in the intrinsic name
+            ["load", ord] => this.atomic_load(args, dest, read_ord(ord))?,
             ["store", ord] => this.atomic_store(args, write_ord(ord))?,
 
             ["fence", ord] => this.atomic_fence_intrinsic(args, fence_ord(ord))?,

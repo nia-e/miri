@@ -35,6 +35,29 @@ pub enum AccessEvent {
     Write(Range<usize>),
 }
 
+/// The result(s) of a call to a `libc` allocation-related function. Note that
+/// some function e.g. `realloc` will generate multiple events (an allocation
+/// and a deallocation).
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub enum LibcEvent {
+    /// A heap allocation was created spanning the addresses in the range.
+    Malloc(Range<usize>),
+    /// A pointer with the inner address was `free`d.
+    Free(usize),
+}
+
+/// A singular page mapping or unmapping. The inner field is always a page-aligned
+/// address, representing a single system page being mapped/unmapped.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub enum MmapEvent {
+    /// The range from this address to one system page past it was mapped to
+    /// memory.
+    Mmap(usize),
+    /// The range from this address to one system page past it was unmapped
+    /// from memory
+    Munmap(usize),
+}
+
 /// The final results of an FFI trace, containing every relevant event detected
 /// by the tracer.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -44,4 +67,12 @@ pub struct MemEvents {
     /// A value modulo which `AccessEvent` ranges stay the same length. Makes
     /// parsing the events a lot easier. Should likely just be the page size.
     pub alloc_cutoff: usize,
+    /// An ordered list of libc events that occurred. `malloc`s which were `free`d
+    /// before the end of the FFI call will have been removed on a best-effort
+    /// basis, but nothing else.
+    pub libc_events: Vec<LibcEvent>,
+    /// An ordered list of page mappings and unmappings that occurred. Same as
+    /// for `libc_events`, mappings that were unmapped will have been removed,
+    /// but nothing else.
+    pub mmap_events: Vec<MmapEvent>,
 }
