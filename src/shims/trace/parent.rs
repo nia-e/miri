@@ -354,9 +354,9 @@ fn get_disasm() -> capstone::Capstone {
         #[cfg(target_arch = "x86")]
         {cs_pre.x86().mode(arch::x86::ArchMode::Mode32)}
         #[cfg(target_arch = "aarch64")]
-        {cs_pre.arm64()}
+        {cs_pre.arm64().mode(arch::arm64::ArchMode::Arm)}
         #[cfg(target_arch = "arm")]
-        {cs_pre.arm()}
+        {cs_pre.arm().mode(arch::arm::ArchMode::Arm)}
         #[cfg(target_arch = "riscv64")]
         {cs_pre.riscv().mode(arch::riscv::ArchMode::RiscV64)}
         #[cfg(target_arch = "riscv32")]
