@@ -564,7 +564,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                                     opt_so_far = Some(so_far);
                                 } else {
                                     // When there's a jump, push what we have so far and start anew
-                                    into.push((so_far.start as usize + p)..(so_far.end as usize + p));
+                                    into.push(
+                                        (so_far.start as usize + p)..(so_far.end as usize + p),
+                                    );
                                     opt_so_far = Some(bit..bit + 1);
                                 },
                             // 1st time we obviously need to insert it

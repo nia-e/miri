@@ -275,9 +275,7 @@ pub fn sv_loop(
             // end_ffi was called by the child
             ExecEvent::End => {
                 // Hand over the access info we traced
-                event_tx
-                    .send(MemEvents { acc_events, alloc_cutoff: page_size })
-                    .unwrap();
+                event_tx.send(MemEvents { acc_events, alloc_cutoff: page_size }).unwrap();
                 // And reset our values
                 acc_events = Vec::new();
                 ch_stack = None;
@@ -723,12 +721,7 @@ pub unsafe extern "C" fn mempr_on() {
     let len = PAGE_SIZE.load(Ordering::Relaxed).wrapping_mul(PAGE_COUNT.load(Ordering::Relaxed));
     // SAFETY: Upheld by caller
     unsafe {
-        if libc::mprotect(
-            PAGE_ADDR.load(Ordering::Relaxed).cast(),
-            len,
-            libc::PROT_NONE,
-        ) != 0
-        {
+        if libc::mprotect(PAGE_ADDR.load(Ordering::Relaxed).cast(), len, libc::PROT_NONE) != 0 {
             std::process::exit(-1);
         }
     }
