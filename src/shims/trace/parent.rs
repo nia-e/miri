@@ -16,8 +16,10 @@ const WAIT_FLAGS: wait::WaitPidFlag =
 /// assuming nothing bigger than AVX-512 is available.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const ARCH_MAX_ACCESS_SIZE: usize = 64;
+/// The largest arm64 simd instruction operates on 16 bytes.
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 const ARCH_MAX_ACCESS_SIZE: usize = 16;
+/// The max riscv vector instruction can access 8 consecutive 32-bit values.
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 const ARCH_MAX_ACCESS_SIZE: usize = 32;
 
@@ -56,8 +58,11 @@ trait ArchIndependentRegs {
 #[expect(clippy::as_conversions)]
 #[rustfmt::skip]
 impl ArchIndependentRegs for libc::user_regs_struct {
+    #[inline]
     fn ip(&self) -> usize { self.rip as _ }
+    #[inline]
     fn set_ip(&mut self, ip: usize) { self.rip = ip as _ }
+    #[inline]
     fn set_sp(&mut self, sp: usize) { self.rsp = sp as _ }
 }
 
@@ -65,8 +70,11 @@ impl ArchIndependentRegs for libc::user_regs_struct {
 #[expect(clippy::as_conversions)]
 #[rustfmt::skip]
 impl ArchIndependentRegs for libc::user_regs_struct {
+    #[inline]
     fn ip(&self) -> usize { self.eip as _ }
+    #[inline]
     fn set_ip(&mut self, ip: usize) { self.eip = ip as _ }
+    #[inline]
     fn set_sp(&mut self, sp: usize) { self.esp = sp as _ }
 }
 
@@ -74,8 +82,11 @@ impl ArchIndependentRegs for libc::user_regs_struct {
 #[expect(clippy::as_conversions)]
 #[rustfmt::skip]
 impl ArchIndependentRegs for libc::user_regs_struct {
+    #[inline]
     fn ip(&self) -> usize { self.pc as _ }
+    #[inline]
     fn set_ip(&mut self, ip: usize) { self.pc = ip as _ }
+    #[inline]
     fn set_sp(&mut self, sp: usize) { self.sp = sp as _ }
 }
 
@@ -83,8 +94,11 @@ impl ArchIndependentRegs for libc::user_regs_struct {
 #[expect(clippy::as_conversions)]
 #[rustfmt::skip]
 impl ArchIndependentRegs for libc::user_regs_struct {
+    #[inline]
     fn ip(&self) -> usize { self.pc as _ }
+    #[inline]
     fn set_ip(&mut self, ip: usize) { self.pc = ip as _ }
+    #[inline]
     fn set_sp(&mut self, sp: usize) { self.sp = sp as _ }
 }
 
@@ -650,8 +664,8 @@ fn handle_segfault(
         });
 
         // Now figure out the size + type of access and log it down
-        // For now this will mark down e.g. the same area being read multiple
-        // times, but that's still correct even if a bit inefficient
+        // This will mark down e.g. the same area being read multiple times,
+        // since it's more efficient to compress the accesses at the end
         if capstone_disassemble(&instr, addr, page_size, cs, acc_events).is_err() {
             // Read goes first because we need to be pessimistic
             acc_events.push(AccessEvent::Read(addr..addr.strict_add(ARCH_MAX_ACCESS_SIZE)));
