@@ -585,10 +585,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let mut writes = vec![];
         decompress(reads_bitset, &mut reads);
         decompress(writes_bitset, &mut writes);
-        //eprintln!("reads: {reads:#0x?}");
-        //eprintln!("writes: {writes:#0x?}");
-        let _exposed: Vec<AllocId> =
+        let exposed: Vec<AllocId> =
             this.machine.alloc_addresses.get_mut().exposed.iter().copied().collect();
+        eprintln!("=== PROCESSED DATA ===");
+        eprintln!("reads: {}\n{reads:#0x?}", reads.len());
+        eprintln!("writes: {}\n{writes:#0x?}", writes.len());
+        eprintln!("exposed: {}\n{exposed:?}", exposed.len());
+        eprintln!("=== END RUN ===");
         interp_ok(())
         //this.apply_accesses(exposed, events.reads, events.writes)
     }

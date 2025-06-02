@@ -236,6 +236,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         #[cfg(target_os = "linux")]
         if let Some(events) = maybe_memevents {
+            eprintln!("=== BEGIN RUN ===");
+            eprintln!("=== PRELIMINARY DATA ===");
+            eprintln!("{events:#0x?}");
             this.apply_events(events)?;
         }
         #[cfg(not(target_os = "linux"))]
