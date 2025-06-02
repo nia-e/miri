@@ -1,10 +1,9 @@
-use std::sync::atomic::{AtomicPtr, AtomicU64};
+use std::sync::atomic::{AtomicPtr, AtomicUsize};
 
 use ipc_channel::ipc;
 use nix::sys::{ptrace, signal, wait};
 use nix::unistd;
 
-use crate::helpers::ToU64;
 use crate::shims::trace::{AccessEvent, FAKE_STACK_SIZE, MemEvents, StartFfiInfo, TraceRequest};
 
 /// The flags to use when calling `waitid()`.
@@ -16,27 +15,26 @@ const WAIT_FLAGS: wait::WaitPidFlag =
 /// Arch-specific maximum size a single access might perform. x86 value is set
 /// assuming nothing bigger than AVX-512 is available.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const ARCH_MAX_ACCESS_SIZE: u64 = 64;
+const ARCH_MAX_ACCESS_SIZE: usize = 64;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-const ARCH_MAX_ACCESS_SIZE: u64 = 16;
+const ARCH_MAX_ACCESS_SIZE: usize = 16;
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
-const ARCH_MAX_ACCESS_SIZE: u64 = 16;
+const ARCH_MAX_ACCESS_SIZE: usize = 16;
 
-/// The default word size on a given platform, in bytes. Only for targets where
-/// this is actually used.
-#[cfg(target_arch = "arm")]
-const ARCH_WORD_SIZE: u64 = 4;
-#[cfg(target_arch = "aarch64")]
-const ARCH_WORD_SIZE: u64 = 8;
+/// The default word size on a given platform, in bytes.
+#[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "riscv32"))]
+const ARCH_WORD_SIZE: usize = 4;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+const ARCH_WORD_SIZE: usize = 8;
 
 /// The address of the page set to be edited, initialised to a sentinel null
 /// pointer.
 static PAGE_ADDR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 /// The host pagesize, initialised to a sentinel zero value.
-pub static PAGE_SIZE: AtomicU64 = AtomicU64::new(0);
+pub static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 /// How many consecutive pages to unprotect. 1 by default, unlikely to be set
 /// higher than 2.
-static PAGE_COUNT: AtomicU64 = AtomicU64::new(1);
+static PAGE_COUNT: AtomicUsize = AtomicUsize::new(1);
 
 /// Allows us to get common arguments from the `user_regs_t` across architectures.
 /// Normally this would land us ABI hell, but thankfully all of our usecases
@@ -231,7 +229,7 @@ pub fn sv_loop(
     listener: ChildListener,
     event_tx: ipc::IpcSender<MemEvents>,
     confirm_tx: ipc::IpcSender<()>,
-    page_size: u64,
+    page_size: usize,
 ) -> Result<!, Option<i32>> {
     // Things that we return to the child process
     let mut acc_events = Vec::new();
@@ -278,7 +276,7 @@ pub fn sv_loop(
             ExecEvent::End => {
                 // Hand over the access info we traced
                 event_tx
-                    .send(MemEvents { acc_events, alloc_cutoff: page_size.try_into().unwrap() })
+                    .send(MemEvents { acc_events, alloc_cutoff: page_size })
                     .unwrap();
                 // And reset our values
                 acc_events = Vec::new();
@@ -400,9 +398,9 @@ fn wait_for_signal(
 /// or kills the child and returns the appropriate error otherwise.
 fn handle_segfault(
     pid: unistd::Pid,
-    ch_pages: &[u64],
+    ch_pages: &[usize],
     ch_stack: usize,
-    page_size: u64,
+    page_size: usize,
     cs: &capstone::Capstone,
     acc_events: &mut Vec<AccessEvent>,
 ) -> Result<(), ExecError> {
@@ -410,8 +408,8 @@ fn handle_segfault(
     #[inline]
     fn capstone_disassemble(
         instr: &[u8],
-        addr: u64,
-        page_size: u64,
+        addr: usize,
+        page_size: usize,
         cs: &capstone::Capstone,
         acc_events: &mut Vec<AccessEvent>,
     ) -> capstone::CsResult<()> {
@@ -425,10 +423,10 @@ fn handle_segfault(
         let arch_detail = ins_detail.arch_detail();
 
         // Take an (addr, size, cutoff_size) and split an access into multiple if needed
-        let get_ranges: fn(u64, u64, u64) -> Vec<std::ops::Range<u64>> =
-            |addr, size, cutoff_size: u64| {
+        let get_ranges: fn(usize, usize, usize) -> Vec<std::ops::Range<usize>> =
+            |addr, size, cutoff_size: usize| {
                 let addr_added = addr.strict_add(size);
-                let mut counter = 0u64;
+                let mut counter = 0usize;
                 let mut ret = vec![];
                 loop {
                     let curr = addr.strict_add(counter.strict_mul(cutoff_size));
@@ -582,7 +580,7 @@ fn handle_segfault(
     // All x86, ARM, etc. instructions only have at most one memory operand
     // (thankfully!)
     // SAFETY: si_addr is safe to call
-    let addr = unsafe { siginfo.si_addr().addr().to_u64() };
+    let addr = unsafe { siginfo.si_addr().addr() };
     let page_addr = addr.strict_sub(addr.strict_rem(page_size));
 
     if ch_pages.iter().any(|pg| (*pg..pg.strict_add(page_size)).contains(&addr)) {
@@ -640,8 +638,8 @@ fn handle_segfault(
         let regs_bak = ptrace::getregs(pid).unwrap();
         new_regs = regs_bak;
         let ip_poststep = regs_bak.ip();
-        // We need to do reads/writes in 8-byte chunks
-        let diff = (ip_poststep.strict_sub(ip_prestep)).div_ceil(8);
+        // We need to do reads/writes in word-sized chunks
+        let diff = (ip_poststep.strict_sub(ip_prestep)).div_ceil(ARCH_WORD_SIZE);
         let instr = (ip_prestep..ip_prestep.strict_add(diff)).fold(vec![], |mut ret, ip| {
             // This only needs to be a valid pointer in the child process, not ours
             ret.append(
@@ -702,7 +700,7 @@ pub unsafe extern "C" fn mempr_off() {
         // we mustn't unwind from here, so...
         if libc::mprotect(
             PAGE_ADDR.load(Ordering::Relaxed).cast(),
-            len.try_into().unwrap_unchecked(),
+            len,
             libc::PROT_READ | libc::PROT_WRITE,
         ) != 0
         {
@@ -727,7 +725,7 @@ pub unsafe extern "C" fn mempr_on() {
     unsafe {
         if libc::mprotect(
             PAGE_ADDR.load(Ordering::Relaxed).cast(),
-            len.try_into().unwrap_unchecked(),
+            len,
             libc::PROT_NONE,
         ) != 0
         {

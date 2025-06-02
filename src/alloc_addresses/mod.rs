@@ -501,8 +501,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let alloc_cutoff = events.alloc_cutoff;
         // FIXME: these could be u16s
         //eprintln!("bare accesses: {:#0x?}", events.acc_events);
-        let mut reads_bitset: Vec<(DenseBitSet<u32>, u64)> = vec![];
-        let mut writes_bitset: Vec<(DenseBitSet<u32>, u64)> = vec![];
+        let mut reads_bitset: Vec<(DenseBitSet<u32>, usize)> = vec![];
+        let mut writes_bitset: Vec<(DenseBitSet<u32>, usize)> = vec![];
         for acc in events.acc_events {
             match acc {
                 // Reads have more logic to them since we don't want to count
@@ -510,7 +510,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // if the write has yet to happen
                 shims::trace::AccessEvent::Read(range) => {
                     // The tracer ensures access ranges don't go over this alignment
-                    let pg = range.start - range.start % alloc_cutoff.to_u64();
+                    let pg = range.start - range.start % alloc_cutoff;
                     for byte in range {
                         #[expect(clippy::as_conversions)]
                         let ofs = (byte - pg) as u32;
@@ -536,7 +536,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // at the same time as reads for this to be useful. We just
                 // insert ranges into the appropriate bitset
                 shims::trace::AccessEvent::Write(range) => {
-                    let pg = range.start - range.start % alloc_cutoff.to_u64();
+                    let pg = range.start - range.start % alloc_cutoff;
                     #[expect(clippy::as_conversions)]
                     let rg_norm = ((range.start - pg) as u32)..((range.end - pg) as u32);
                     let pos = writes_bitset.iter().position(|(_, p)| *p == pg).unwrap_or({
@@ -547,9 +547,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
             }
         }
-        // The rustc side expects a `Vec<Range<u64>>`, not our monstrosity, so
+        // The rustc side expects a `Vec<Range<usize>>`, not our monstrosity, so
         // this turns our bitset vector into one of ranges
-        let decompress: fn(Vec<(DenseBitSet<u32>, u64)>, &mut Vec<std::ops::Range<u64>>) =
+        let decompress: fn(Vec<(DenseBitSet<u32>, usize)>, &mut Vec<std::ops::Range<usize>>) =
             |sets, into| {
                 sets.into_iter().for_each(|(set, p)| {
                     // Iterates over the indices of 1s and so long as they
@@ -564,7 +564,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                                     opt_so_far = Some(so_far);
                                 } else {
                                     // When there's a jump, push what we have so far and start anew
-                                    into.push((so_far.start as u64 + p)..(so_far.end as u64 + p));
+                                    into.push((so_far.start as usize + p)..(so_far.end as usize + p));
                                     opt_so_far = Some(bit..bit + 1);
                                 },
                             // 1st time we obviously need to insert it
@@ -575,7 +575,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     // (or this set was empty)
                     #[expect(clippy::as_conversions)]
                     if let Some(so_far) = opt_so_far {
-                        into.push((so_far.start as u64 + p)..(so_far.end as u64 + p));
+                        into.push((so_far.start as usize + p)..(so_far.end as usize + p));
                     }
                 });
             };

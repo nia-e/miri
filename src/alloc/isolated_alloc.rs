@@ -3,8 +3,6 @@ use std::alloc::{self, Layout};
 use nix::sys::mman;
 use rustc_index::bit_set::DenseBitSet;
 
-use crate::helpers::ToU64;
-
 /// How many bytes of memory each bit in the bitset represents.
 const COMPRESSION_FACTOR: usize = 4;
 
@@ -274,12 +272,12 @@ impl IsolatedAlloc {
     }
 
     /// Returns a vector of page addresses managed by the allocator.
-    pub fn pages(&self) -> Vec<u64> {
+    pub fn pages(&self) -> Vec<usize> {
         let mut pages: Vec<_> =
-            self.page_ptrs.clone().into_iter().map(|p| p.addr().to_u64()).collect();
+            self.page_ptrs.clone().into_iter().map(|p| p.addr()).collect();
         self.huge_ptrs.iter().for_each(|(ptr, size)| {
             for i in 0..size / self.page_size {
-                pages.push(unsafe { ptr.add(i * self.page_size).expose_provenance().to_u64() });
+                pages.push(unsafe { ptr.add(i * self.page_size).expose_provenance() });
             }
         });
         pages

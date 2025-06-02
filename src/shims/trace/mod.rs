@@ -13,11 +13,10 @@ const FAKE_STACK_SIZE: usize = 1024;
 struct StartFfiInfo {
     /// A vector of page addresses. These should have been automatically obtained
     /// with `IsolatedAlloc::pages` and prepared with `IsolatedAlloc::prepare_ffi`.
-    page_ptrs: Vec<u64>,
+    page_ptrs: Vec<usize>,
     /// The address of an allocation that can serve as a temporary stack.
     /// This should be a leaked `Box<[u8; FAKE_STACK_SIZE]>` cast to an int.
     stack_ptr: usize,
-    //pid: i32,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -31,9 +30,9 @@ enum TraceRequest {
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub enum AccessEvent {
     /// A read may have occurred on no more than the specified address range.
-    Read(Range<u64>),
+    Read(Range<usize>),
     /// A write may have occurred on no more than the specified address range.
-    Write(Range<u64>),
+    Write(Range<usize>),
 }
 
 /// The final results of an FFI trace, containing every relevant event detected
