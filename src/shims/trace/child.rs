@@ -19,7 +19,7 @@ pub struct Supervisor {
     /// Used for synchronisation, allowing us to receive confirmation that the
     /// parent process has handled the request from `message_tx`.
     confirm_rx: ipc::IpcReceiver<()>,
-    /// Receiver for memory acceses that ocurred at the end of the FFI call.
+    /// Receiver for memory acceses that ocurred during the FFI call.
     event_rx: ipc::IpcReceiver<MemEvents>,
 }
 
@@ -144,14 +144,16 @@ impl Supervisor {
 /// receiving back events through `get_events`.
 ///
 /// # Safety
-/// Only a single thread must exist when calling this.
+/// Only a single OS thread must exist in the process when calling this.
 pub unsafe fn init_sv() -> Result<(), SvInitError> {
-    // TODO: Check for `CAP_SYS_PTRACE` if this fails
+    // On Linux, this will check whether ptrace is fully disabled by the Yama module.
+    // If Yama isn't running or we're not on Linux, we'll still error later, but
+    // this saves a very expensive fork call
     let ptrace_status = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope");
     if let Ok(stat) = ptrace_status {
         if let Some(stat) = stat.chars().next() {
-            // Fast-error if ptrace is disabled on the system
-            if stat != '0' && stat != '1' {
+            // Fast-error if ptrace is fully disabled on the system
+            if stat == '3' {
                 return Err(SvInitError);
             }
         }
@@ -159,51 +161,71 @@ pub unsafe fn init_sv() -> Result<(), SvInitError> {
 
     // Initialise the supervisor if it isn't already, placing it into SUPERVISOR
     let mut lock = SUPERVISOR.lock().unwrap();
-    if lock.is_none() {
-        // TODO: Do we want to compress the confirm and event channels into one?
-        let (message_tx, message_rx) = ipc::channel().unwrap();
-        let (confirm_tx, confirm_rx) = ipc::channel().unwrap();
-        let (event_tx, event_rx) = ipc::channel().unwrap();
-        // SAFETY: Calling sysconf(_SC_PAGESIZE) is always safe and cannot error
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.try_into().unwrap();
+    if lock.is_some() {
+        return Ok(());
+    }
 
-        super::parent::PAGE_SIZE.store(page_size, std::sync::atomic::Ordering::Relaxed);
-        unsafe {
-            // SAFETY: Caller upholds that only one thread exists.
-            match unistd::fork().unwrap() {
-                unistd::ForkResult::Parent { child } => {
-                    // If somehow another thread does exist, prevent it from accessing the lock
-                    // and thus breaking our safety invariants
-                    std::mem::forget(lock);
-                    // The child process is free to unwind, so we won't to avoid doubly freeing
-                    // system resources
-                    let p = std::panic::catch_unwind(|| {
-                        let listener = ChildListener {
-                            message_rx,
-                            pid: child,
-                            attached: false,
-                            override_retcode: None,
-                        };
-                        // Trace as many things as possible, to be able to handle them as needed
-                        let options = ptrace::Options::PTRACE_O_TRACESYSGOOD
-                            | ptrace::Options::PTRACE_O_TRACECLONE
-                            | ptrace::Options::PTRACE_O_TRACEFORK;
-                        // Attach to the child process without stopping it
-                        ptrace::seize(child, options).unwrap();
+    // Prepare the IPC channels we need
+    let (message_tx, message_rx) = ipc::channel().unwrap();
+    let (confirm_tx, confirm_rx) = ipc::channel().unwrap();
+    let (event_tx, event_rx) = ipc::channel().unwrap();
+    // SAFETY: Calling sysconf(_SC_PAGESIZE) is always safe and cannot error
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.try_into().unwrap();
 
-                        let code = sv_loop(listener, event_tx, confirm_tx, page_size).unwrap_err();
-                        // If a return code of 0 is not explicitly given, assume something went
-                        // wrong and return 1
-                        std::process::exit(code.unwrap_or(1));
-                    })
-                    .unwrap_err(); // The Ok variant of this is !
-                    eprintln!("Supervisor process panicked!\n{p:?}");
-                    std::process::exit(1);
+    super::parent::PAGE_SIZE.store(page_size, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        // TODO: Maybe use clone3() instead for better signalling of when the child exits?
+        // SAFETY: Caller upholds that only one thread exists.
+        match unistd::fork().unwrap() {
+            unistd::ForkResult::Parent { child } => {
+                // If somehow another thread does exist, prevent it from accessing the lock
+                // and thus breaking our safety invariants
+                std::mem::forget(lock);
+                // The child process is free to unwind, so we won't to avoid doubly freeing
+                // system resources
+                let init = std::panic::catch_unwind(|| {
+                    let listener = ChildListener {
+                        message_rx,
+                        pid: child,
+                        attached: false,
+                        override_retcode: None,
+                    };
+                    // Trace as many things as possible, to be able to handle them as needed
+                    let options = ptrace::Options::PTRACE_O_TRACESYSGOOD
+                        | ptrace::Options::PTRACE_O_TRACECLONE
+                        | ptrace::Options::PTRACE_O_TRACEFORK;
+                    // Attach to the child process without stopping it
+                    match ptrace::seize(child, options) {
+                        // Ptrace works :D
+                        Ok(_) => {
+                            let code =
+                                sv_loop(listener, event_tx, confirm_tx, page_size).unwrap_err();
+                            // If a return code of 0 is not explicitly given, assume something went
+                            // wrong and return 1
+                            std::process::exit(code.unwrap_or(1))
+                        }
+                        // Ptrace does not work and we failed to catch that
+                        Err(_) => {
+                            // If we can't ptrace, Miri continues being the parent
+                            signal::kill(child, signal::SIGKILL).unwrap();
+                            SvInitError
+                        }
+                    }
+                });
+                match init {
+                    // The "Ok" case means that we couldn't ptrace
+                    Ok(e) => return Err(e),
+                    Err(p) => {
+                        eprintln!("Supervisor process panicked!\n{p:?}");
+                        std::process::exit(1);
+                    }
                 }
-                unistd::ForkResult::Child => {
-                    // If we're the child process, save the supervisor info
-                    *lock = Some(Supervisor { message_tx, confirm_rx, event_rx });
-                }
+            }
+            unistd::ForkResult::Child => {
+                // First make sure the parent succeeded with ptracing us!
+                signal::raise(signal::SIGSTOP).unwrap();
+                // If we're the child process, save the supervisor info
+                *lock = Some(Supervisor { message_tx, confirm_rx, event_rx });
             }
         }
     }

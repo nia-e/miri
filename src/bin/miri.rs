@@ -194,6 +194,7 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
 
         #[cfg(target_os = "linux")]
         if config.native_lib.is_some() {
+            // FIXME: This should display a diagnostic / warning on error
             // SAFETY: No other threads have spawned yet
             let _ = unsafe { miri::init_sv() };
         }

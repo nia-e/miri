@@ -234,6 +234,15 @@ pub fn sv_loop(
     // have a reason to use another one.
     let main_pid = listener.pid;
 
+    // There's an initial sigstop we need to deal with
+    wait_for_signal(main_pid, signal::SIGSTOP, false).map_err(|e| {
+        match e {
+            ExecError::Died(code) => code,
+            ExecError::Shrug => None,
+        }
+    })?;
+    ptrace::cont(main_pid, None).unwrap();
+
     for evt in listener {
         match evt {
             // start_ffi was called by the child, so prep memory
