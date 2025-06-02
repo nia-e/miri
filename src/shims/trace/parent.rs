@@ -19,12 +19,15 @@ const WAIT_FLAGS: wait::WaitPidFlag =
 const BREAKPT_INSTR: isize = 0xCC;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 const BREAKPT_INSTR: isize = 0xD420;
-// FIXME: riscv!
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+const BREAKPT_INSTR: isize = 0x730010;
 
 /// The size of the breakpoint-triggering instruction, in bytes.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const BREAKPT_INSTR_SIZE: usize = 1;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+const BREAKPT_INSTR_SIZE: usize = 4;
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 const BREAKPT_INSTR_SIZE: usize = 4;
 
 /// Arch-specific maximum size a single access might perform. x86 value is set
@@ -56,24 +59,25 @@ static PAGE_COUNT: AtomicUsize = AtomicUsize::new(1);
 /// consist of functions with a small number of register-sized integer arguments.
 /// See <https://man7.org/linux/man-pages/man2/syscall.2.html> for sources
 trait ArchIndependentRegs {
-    /// The return value of a function call, if one just happened. All of our
+    /// Gets  return value of a function call, if one just happened. All of our
     /// uses of it involve this being signed, so return it as such.
     fn retval(&self) -> isize;
-    /// The first ptr-sized argument.
+    /// Gets the first ptr-sized argument.
     fn arg1(&self) -> usize;
-    /// The second ptr-sized argument.
+    /// Gets the second ptr-sized argument.
     fn arg2(&self) -> usize;
-    /// If entering a syscall, this is the syscall number. `libc` has this as
-    /// a signed integer, so return it that way here also.
-    fn syscall_nr(&self) -> isize;
-    /// The instruction pointer.
+    /// If entering a syscall, this gets the syscall number. We only use this
+    /// when comparing against values from `libc`, so return it as such to avoid
+    /// extra casts.
+    fn syscall_nr(&self) -> libc::c_long;
+    /// Gets the instruction pointer.
     fn ip(&self) -> usize;
-    /// The stack pointer.
+    /// Gets the stack pointer.
     fn sp(&self) -> usize;
-    /// Set the instruction pointer; remember to also set the stack pointer, or
+    /// Sets the instruction pointer; remember to also set the stack pointer, or
     /// else the stack might get messed up!
     fn set_ip(&mut self, ip: usize);
-    /// Set the stack pointer, ideally to a zeroed-out area.
+    /// Sets the stack pointer, ideally to a zeroed-out area.
     fn set_sp(&mut self, sp: usize);
 }
 
@@ -86,7 +90,7 @@ impl ArchIndependentRegs for libc::user_regs_struct {
     fn retval(&self) -> isize { self.rax as _ }
     fn arg1(&self) -> usize { self.rdi as _ }
     fn arg2(&self) -> usize { self.rsi as _ }
-    fn syscall_nr(&self) -> isize { self.orig_rax as _ }
+    fn syscall_nr(&self) -> libc::c_long { self.orig_rax as _ }
     fn ip(&self) -> usize { self.rip as _ }
     fn sp(&self) -> usize { self.rsp as _ }
     fn set_ip(&mut self, ip: usize) { self.rip = ip as _ }
@@ -100,7 +104,7 @@ impl ArchIndependentRegs for libc::user_regs_struct {
     fn retval(&self) -> isize { self.eax as _ }
     fn arg1(&self) -> usize { self.edi as _ }
     fn arg2(&self) -> usize { self.esi as _ }
-    fn syscall_nr(&self) -> isize { self.orig_eax as _ }
+    fn syscall_nr(&self) -> libc::c_long { self.orig_eax as _ }
     fn ip(&self) -> usize { self.eip as _ }
     fn sp(&self) -> usize { self.esp as _ }
     fn set_ip(&mut self, ip: usize) { self.eip = ip as _ }
@@ -114,7 +118,7 @@ impl ArchIndependentRegs for libc::user_regs_struct {
     fn retval(&self) -> isize { self.regs[0] as _ }
     fn arg1(&self) -> usize { self.regs[0] as _ }
     fn arg2(&self) -> usize { self.regs[1] as _ }
-    fn syscall_nr(&self) -> isize { self.regs[8] as _ }
+    fn syscall_nr(&self) -> libc::c_long { self.regs[8] as _ }
     fn ip(&self) -> usize { self.pc as _ }
     fn sp(&self) -> usize { self.sp as _ }
     fn set_ip(&mut self, ip: usize) { self.pc = ip as _ }
@@ -125,7 +129,12 @@ impl ArchIndependentRegs for libc::user_regs_struct {
 #[expect(clippy::as_conversions)]
 #[rustfmt::skip]
 impl ArchIndependentRegs for libc::user_regs_struct {
+    fn retval(&self) -> isize { self.a0 as _ }
+    fn arg1(&self) -> usize { self.a0 as _ }
+    fn arg2(&self) -> usize { self.a1 as _ }
+    fn syscall_nr(&self) -> libc::c_long { self.a7 as _ }
     fn ip(&self) -> usize { self.pc as _ }
+    fn sp(&self) -> usize { self.sp as _ }
     fn set_ip(&mut self, ip: usize) { self.pc = ip as _ }
     fn set_sp(&mut self, sp: usize) { self.sp = sp as _ }
 }
@@ -470,8 +479,7 @@ pub fn sv_loop(
             ExecEvent::Syscall(pid) => {
                 let regs = ptrace::getregs(pid).unwrap();
                 // Again, the constants are defined as i64/i32 but they're just isizes
-                #[expect(clippy::as_conversions)]
-                match regs.syscall_nr() as _ {
+                match regs.syscall_nr() {
                     libc::SYS_mmap => {
                         // No need for a discrete fn here, it's very tiny.
                         // The length is guaranteed to be to be a multiple of
@@ -479,7 +487,7 @@ pub fn sv_loop(
                         // the syscall will error if it's not
                         let pg_count = regs.arg2().strict_div(page_size);
                         // Wait for the exit from the call now
-                        let regs = match wait_for_syscall(pid, libc::SYS_mmap as _) {
+                        let regs = match wait_for_syscall(pid, libc::SYS_mmap) {
                             Ok(regs) => regs,
                             Err(e) =>
                                 match e {
@@ -595,7 +603,7 @@ fn wait_for_signal(
 
 /// Waits for the child to return from its current syscall, grabbing its registers.
 /// DO NOT call `ptrace::syscall()` right before this!
-fn wait_for_syscall(pid: unistd::Pid, syscall: isize) -> Result<libc::user_regs_struct, ExecError> {
+fn wait_for_syscall(pid: unistd::Pid, syscall: libc::c_long) -> Result<libc::user_regs_struct, ExecError> {
     // We always want an initial call to this
     ptrace::syscall(pid, None).unwrap();
     // There's no way this fails except if the child dies somehow
@@ -664,8 +672,7 @@ fn handle_munmap(
         }
     }
 
-    #[expect(clippy::as_conversions)]
-    let regs = wait_for_syscall(pid, libc::SYS_munmap as _)?;
+    let regs = wait_for_syscall(pid, libc::SYS_munmap)?;
 
     // munmap returns 0 on success
     if regs.retval() == 0 {
