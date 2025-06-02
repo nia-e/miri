@@ -19,7 +19,7 @@ const ARCH_MAX_ACCESS_SIZE: usize = 64;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 const ARCH_MAX_ACCESS_SIZE: usize = 16;
 #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
-const ARCH_MAX_ACCESS_SIZE: usize = 16;
+const ARCH_MAX_ACCESS_SIZE: usize = 32;
 
 /// The default word size on a given platform, in bytes.
 #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "riscv32"))]
