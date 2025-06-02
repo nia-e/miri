@@ -733,7 +733,7 @@ impl<'tcx> MiriMachine<'tcx> {
                     ),
                     #[cfg(target_os = "linux")]
                     note!(
-                        "this is normally partially mitigated by making use of ptrace to monitor memory accesses, but it seems to be unavailable on your system"
+                        "this is normally partially mitigated, but either -Zmiri-force-old-native-lib-mode was passed or ptrace is disabled on your system"
                     ),
                 ]
             }

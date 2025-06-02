@@ -151,6 +151,8 @@ pub struct MiriConfig {
     /// The location of a shared object file to load when calling external functions
     /// FIXME! consider allowing users to specify paths to multiple files, or to a directory
     pub native_lib: Option<PathBuf>,
+    /// Whether to force using the old native lib behaviour even if ptrace might be supported.
+    pub force_old_native_lib: bool,
     /// Run a garbage collector for BorTags every N basic blocks.
     pub gc_interval: u32,
     /// The number of CPUs to be reported by miri.
@@ -198,6 +200,7 @@ impl Default for MiriConfig {
             report_progress: None,
             retag_fields: RetagFields::Yes,
             native_lib: None,
+            force_old_native_lib: false,
             gc_interval: 10_000,
             num_cpus: 1,
             page_size: None,

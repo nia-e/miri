@@ -8,20 +8,26 @@ use crate::helpers::ToU64;
 use crate::shims::trace::{AccessEvent, FAKE_STACK_SIZE, MemEvents, StartFfiInfo, TraceRequest};
 
 /// The flags to use when calling `waitid()`.
-/// FIXME: bitwise OR for the `nix` versions of these types is not `const`, but
-/// it should be!
+/// Since bitwise or on the nix version of these flags is implemented as a trait,
+/// this cannot be const directly so we do it this way
 const WAIT_FLAGS: wait::WaitPidFlag =
     wait::WaitPidFlag::from_bits_truncate(libc::WUNTRACED | libc::WEXITED);
 
 /// Arch-specific maximum size a single access might perform. x86 value is set
 /// assuming nothing bigger than AVX-512 is available.
-/// FIXME: For certain architectures (e.g. ARM) we may be able to tell apart
-/// SIMD from non-SIMD instructions, and thus put a much lower bound on the
-/// access size.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const ARCH_MAX_ACCESS_SIZE: u64 = 64;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 const ARCH_MAX_ACCESS_SIZE: u64 = 16;
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+const ARCH_MAX_ACCESS_SIZE: u64 = 16;
+
+/// The default word size on a given platform, in bytes. Only for targets where
+/// this is actually used.
+#[cfg(target_arch = "arm")]
+const ARCH_WORD_SIZE: u64 = 4;
+#[cfg(target_arch = "aarch64")]
+const ARCH_WORD_SIZE: u64 = 8;
 
 /// The address of the page set to be edited, initialised to a sentinel null
 /// pointer.
@@ -37,7 +43,7 @@ static PAGE_COUNT: AtomicU64 = AtomicU64::new(1);
 /// consist of functions with a small number of register-sized integer arguments.
 /// See <https://man7.org/linux/man-pages/man2/syscall.2.html> for sources
 trait ArchIndependentRegs {
-    /// The instruction pointer.
+    /// Gets the address of the instruction pointer.
     fn ip(&self) -> usize;
     /// Set the instruction pointer; remember to also set the stack pointer, or
     /// else the stack might get messed up!
@@ -75,7 +81,14 @@ impl ArchIndependentRegs for libc::user_regs_struct {
     fn set_sp(&mut self, sp: usize) { self.sp = sp as _ }
 }
 
-// TODO: add more architectures!
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[expect(clippy::as_conversions)]
+#[rustfmt::skip]
+impl ArchIndependentRegs for libc::user_regs_struct {
+    fn ip(&self) -> usize { self.pc as _ }
+    fn set_ip(&mut self, ip: usize) { self.pc = ip as _ }
+    fn set_sp(&mut self, sp: usize) { self.sp = sp as _ }
+}
 
 /// A unified event representing something happening on the child process. Wraps
 /// `nix`'s `WaitStatus` and our custom signals so it can all be done with one
@@ -432,8 +445,8 @@ fn handle_segfault(
             };
 
         for op in arch_detail.operands() {
-            // TODO: cfg() parts out?
             match op {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                 arch::ArchOperand::X86Operand(x86_operand) => {
                     match x86_operand.op_type {
                         // We only care about memory accesses
@@ -463,18 +476,39 @@ fn handle_segfault(
                         _ => (),
                     }
                 }
+                #[cfg(target_arch = "aarch64")]
                 arch::ArchOperand::Arm64Operand(arm64_operand) => {
-                    // Annoyingly, we don't get the size here, so just be pessimistic for now
+                    // Annoyingly, we don't always get the size here, so just be pessimistic for now
                     match arm64_operand.op_type {
                         arch::arm64::Arm64OperandType::Mem(_) => {
-                            let append = get_ranges(addr, ARCH_MAX_ACCESS_SIZE, page_size);
+                            // B = 1 byte, H = 2 bytes, S = 4 bytes, D = 8 bytes, Q = 16 bytes
+                            let size = match arm64_operand.vas {
+                                // Not an fp/simd instruction
+                                arch::arm64::Arm64Vas::ARM64_VAS_INVALID => ARCH_WORD_SIZE,
+                                // 1 byte
+                                arch::arm64::Arm64Vas::ARM64_VAS_1B => 1,
+                                // 2 bytes
+                                arch::arm64::Arm64Vas::ARM64_VAS_1H => 2,
+                                // 4 bytes
+                                arch::arm64::Arm64Vas::ARM64_VAS_4B
+                                | arch::arm64::Arm64Vas::ARM64_VAS_2H
+                                | arch::arm64::Arm64Vas::ARM64_VAS_1S => 4,
+                                // 8 bytes
+                                arch::arm64::Arm64Vas::ARM64_VAS_8B
+                                | arch::arm64::Arm64Vas::ARM64_VAS_4H
+                                | arch::arm64::Arm64Vas::ARM64_VAS_2S
+                                | arch::arm64::Arm64Vas::ARM64_VAS_1D => 8,
+                                // 16 bytes
+                                arch::arm64::Arm64Vas::ARM64_VAS_16B
+                                | arch::arm64::Arm64Vas::ARM64_VAS_8H
+                                | arch::arm64::Arm64Vas::ARM64_VAS_4S
+                                | arch::arm64::Arm64Vas::ARM64_VAS_2D
+                                | arch::arm64::Arm64Vas::ARM64_VAS_1Q => 16,
+                            };
+                            let append = get_ranges(addr, size, page_size);
                             // FIXME: This now has access type info in the latest
                             // git version of capstone because this pissed me off
                             // and I added it. Change this when it updates
-
-                            // Also FIXME: We do get some info on whether this
-                            // is a vector instruction, maybe we can limit the
-                            // max size based on that?
                             acc_events.append(
                                 &mut append.clone().into_iter().map(AccessEvent::Read).collect(),
                             );
@@ -485,10 +519,18 @@ fn handle_segfault(
                         _ => (),
                     }
                 }
+                #[cfg(target_arch = "arm")]
                 arch::ArchOperand::ArmOperand(arm_operand) =>
                     match arm_operand.op_type {
                         arch::arm::ArmOperandType::Mem(_) => {
-                            let append = get_ranges(addr, ARCH_MAX_ACCESS_SIZE, page_size);
+                            // We don't get info on the size of the access, but
+                            // we're at least told if it's a vector inssizetruction
+                            let size = if arm_operand.vector_index.is_some() {
+                                ARCH_MAX_ACCESS_SIZE
+                            } else {
+                                ARCH_WORD_SIZE
+                            };
+                            let append = get_ranges(addr, size, page_size);
                             let acc_ty = arm_operand.access.unwrap();
                             if acc_ty.is_readable() {
                                 acc_events.append(
@@ -511,7 +553,22 @@ fn handle_segfault(
                         }
                         _ => (),
                     },
-                arch::ArchOperand::RiscVOperand(_risc_voperand) => todo!(),
+                #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+                arch::ArchOperand::RiscVOperand(risc_voperand) => {
+                    match risc_voperand {
+                        arch::riscv::RiscVOperand::Mem(_) => {
+                            // We get basically no info here
+                            let append = get_ranges(addr, ARCH_MAX_ACCESS_SIZE, page_size);
+                            acc_events.append(
+                                &mut append.clone().into_iter().map(AccessEvent::Read).collect(),
+                            );
+                            acc_events.append(
+                                &mut append.clone().into_iter().map(AccessEvent::Write).collect(),
+                            );
+                        }
+                        _ => (),
+                    }
+                }
                 _ => unimplemented!(),
             }
         }

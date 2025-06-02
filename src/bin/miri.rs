@@ -193,7 +193,7 @@ impl rustc_driver::Callbacks for MiriCompilerCalls {
         };
 
         #[cfg(target_os = "linux")]
-        if config.native_lib.is_some() {
+        if config.native_lib.is_some() && !config.force_old_native_lib {
             // FIXME: This should display a diagnostic / warning on error
             // SAFETY: No other threads have spawned yet
             let _ = unsafe { miri::init_sv() };
@@ -708,6 +708,8 @@ fn main() {
             } else {
                 show_error!("-Zmiri-native-lib `{}` does not exist", filename);
             }
+        } else if arg == "-Zmiri-force-old-native-lib-mode" {
+            miri_config.force_old_native_lib = true;
         } else if let Some(param) = arg.strip_prefix("-Zmiri-num-cpus=") {
             let num_cpus = param
                 .parse::<u32>()
