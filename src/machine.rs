@@ -603,7 +603,7 @@ pub struct MiriMachine<'tcx> {
     /// Remembers whether we already warned about an extern type with Stacked Borrows.
     pub(crate) sb_extern_type_warned: Cell<bool>,
     /// Remember whether we already warned about sharing memory with a native call.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "native-lib"))]
     pub(crate) native_call_mem_warned: Cell<bool>,
     /// Remembers which shims have already shown the warning about erroring in isolation.
     pub(crate) reject_in_isolation_warned: RefCell<FxHashSet<String>>,
@@ -771,7 +771,7 @@ impl<'tcx> MiriMachine<'tcx> {
             pthread_rwlock_sanity: Cell::new(false),
             pthread_condvar_sanity: Cell::new(false),
             sb_extern_type_warned: Cell::new(false),
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "native-lib"))]
             native_call_mem_warned: Cell::new(false),
             reject_in_isolation_warned: Default::default(),
             int2ptr_warned: Default::default(),
@@ -949,7 +949,7 @@ impl VisitProvenance for MiriMachine<'_> {
             pthread_rwlock_sanity: _,
             pthread_condvar_sanity: _,
             sb_extern_type_warned: _,
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "native-lib"))]
             native_call_mem_warned: _,
             reject_in_isolation_warned: _,
             int2ptr_warned: _,
