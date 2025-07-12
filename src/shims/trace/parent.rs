@@ -288,6 +288,8 @@ impl MagicLibcValues {
     /// 
     /// While `ptrace::{read, write}` say they need an i64/i32, it's actually
     /// just an `isize` since it depends on the platform.
+    /// 
+    /// TODO: this is unnecessary!! we don't overwrite these in our own process!!
     #[expect(clippy::as_conversions)]
     fn read() -> Self {
         // No other real way to do this
