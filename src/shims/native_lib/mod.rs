@@ -227,29 +227,38 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         for evt in events.acc_events {
             let evt_rg = evt.get_range();
-            // We're assuming an access only touches 1 allocation.
-            let alloc_id = this
-                .alloc_id_from_addr(evt_rg.addr.to_u64(), evt_rg.size.try_into().unwrap(), true)
-                .expect("Foreign code did an out-of-bounds access!");
 
-            let alloc = this.get_alloc_raw(alloc_id)?;
-            let alloc_addr = alloc.get_bytes_unchecked_raw().addr();
+            // LLVM at least permits vectorising accesses to adjacent allocations,
+            // so we cannot assume 1 access = 1 allocation. :(
+            let mut rg = evt_rg.addr..evt_rg.end();
+            while let Some(curr) = rg.next() {
+                let alloc_id = this
+                    .alloc_id_from_addr(curr.to_u64(), rg.len().try_into().unwrap(), true)
+                    .expect("Foreign code did an out-of-bounds access!");
+                let alloc = this.get_alloc_raw(alloc_id)?;
+                let alloc_addr = alloc.get_bytes_unchecked_raw().addr();
 
-            // Shift the overlap range to be an offset from the allocation base addr.
-            let overlap = evt_rg.addr.strict_sub(alloc_addr)..evt_rg.end().strict_sub(alloc_addr);
+                // Skip forward however many bytes of the access are contained in the current allocation.
+                let overlap_size = alloc.len().strict_sub(evt_rg.addr.saturating_sub(alloc_addr));
+                let _ = rg.advance_by(overlap_size);
 
-            // Reads are infallible, writes might not be.
-            if evt.is_read() {
-                let p_map = alloc.provenance();
-                for idx in overlap {
-                    // If a provenance was read by the foreign code, expose it.
-                    if let Some(prov) = p_map.get(Size::from_bytes(idx), this) {
-                        this.expose_provenance(prov)?;
+                // Get an overlap range as an offset from the allocation base addr.
+                let overlap_start = evt_rg.addr.strict_sub(alloc_addr);
+                let overlap = overlap_start..overlap_start.strict_add(overlap_size);
+
+                // Reads are infallible, writes might not be.
+                if evt.is_read() {
+                    let p_map = alloc.provenance();
+                    for idx in overlap {
+                        // If a provenance was read by the foreign code, expose it.
+                        if let Some(prov) = p_map.get(Size::from_bytes(idx), this) {
+                            this.expose_provenance(prov)?;
+                        }
                     }
+                } else if evt.definitely_happened() || alloc.mutability.is_mut() {
+                    //let (alloc, cx) = this.get_alloc_raw_mut(alloc_id)?;
+                    //alloc.process_native_write(AllocRange { start: overlap.start, size: overlap.len() })
                 }
-            } else if evt.definitely_happened() || alloc.mutability.is_mut() {
-                //let (alloc, cx) = this.get_alloc_raw_mut(alloc_id)?;
-                //alloc.process_native_write(AllocRange { start: overlap.start, size: overlap.len() })
             }
         }
 
