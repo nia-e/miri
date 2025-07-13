@@ -10,6 +10,8 @@ fn main() {
     test_access_simple();
     test_access_nested();
     test_access_static();
+    test_access_struct();
+    test_access_struct_complex();
 }
 
 /// Test function that dereferences an int pointer and prints its contents from C.
