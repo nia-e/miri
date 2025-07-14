@@ -1,4 +1,4 @@
-//revisions: trace notrace
+//@revisions: trace notrace
 //@[trace] only-target: linux
 //@[trace] only-target: gnu
 //@[trace] only-target: x86
