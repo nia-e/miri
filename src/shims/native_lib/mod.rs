@@ -16,6 +16,7 @@ use rustc_middle::ty::{self, Ty};
 use rustc_span::Symbol;
 use serde::{Deserialize, Serialize};
 
+use self::trace::EvalContextExt as _;
 use crate::*;
 
 #[cfg_attr(
@@ -100,16 +101,16 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
         ret: (FfiType, Size),
     ) -> InterpResult<'tcx, (Box<[u8]>, Option<MemEvents>)> {
         let this = self.eval_context_mut();
-        #[cfg(target_os = "linux")]
-        let alloc = this.machine.allocator.as_ref().unwrap().clone();
-        #[cfg(not(target_os = "linux"))]
+        //#[cfg(target_os = "linux")]
+        //let alloc = this.machine.allocator.as_ref().unwrap().clone();
+        //#[cfg(not(target_os = "linux"))]
         // Placeholder value.
-        let alloc = ();
+        //let alloc = ();
 
         // Expose InterpCx for use by closure callbacks.
         this.machine.native_lib_ecx_interchange.set(ptr::from_mut(this).expose_provenance());
 
-        let res = trace::Supervisor::do_ffi(&alloc, || {
+        let res = this.do_ffi(|| {
             use libffi::middle::{Arg, Cif, Ret};
 
             let cif = Cif::new(args.iter_mut().map(|arg| arg.ty.take().unwrap()), ret.0);
@@ -180,7 +181,6 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// assumed to be exact.
     fn tracing_apply_accesses(&mut self, events: MemEvents) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
-
         for evt in events.acc_events {
             let evt_rg = evt.get_range();
             // LLVM at least permits vectorising accesses to adjacent allocations,
@@ -190,7 +190,11 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let Some(alloc_id) =
                     this.alloc_id_from_addr(curr.to_u64(), rg.len().try_into().unwrap())
                 else {
-                    throw_ub_format!("Foreign code did an out-of-bounds access!")
+                    throw_ub_format!(
+                        "Foreign code did an out-of-bounds access at {:#0x} for {:#0x} bytes!",
+                        curr,
+                        rg.len(),
+                    );
                 };
                 let alloc = this.get_alloc_raw(alloc_id)?;
                 // The logical and physical address of the allocation coincide, so we can use
@@ -571,7 +575,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let (ret, maybe_memevents) =
             this.call_native_raw(code_ptr, &mut libffi_args, (ret_ty, dest.layout.size))?;
         if tracing {
-            this.tracing_apply_accesses(maybe_memevents.unwrap())?;
+            let mm = maybe_memevents.unwrap();
+            this.tracing_apply_accesses(mm)?;
         }
         this.ffi_ret_to_mem(ret, dest)?;
         interp_ok(true)

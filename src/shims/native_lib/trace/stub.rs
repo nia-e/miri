@@ -12,11 +12,14 @@ impl Supervisor {
     pub fn is_enabled() -> bool {
         false
     }
+}
 
-    pub fn do_ffi<'tcx, T, U>(
-        _: T,
-        f: impl FnOnce() -> U,
-    ) -> InterpResult<'tcx, (U, Option<super::MemEvents>)> {
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
+    fn do_ffi(
+        &mut self,
+        f: impl FnOnce() -> T,
+    ) -> InterpResult<'tcx, (T, Option<super::MemEvents>)> {
         // We acquire the lock to ensure that no two FFI calls run concurrently.
         let _g = SUPERVISOR.lock().unwrap();
         interp_ok((f(), None))
