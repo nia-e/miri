@@ -4,13 +4,17 @@ use std::sync::atomic::Ordering;
 use ipc_channel::ipc;
 use nix::sys::{mman, ptrace, signal};
 use nix::unistd;
+use rustc_abi::{Align, Size};
 use rustc_const_eval::interpret::{InterpResult, interp_ok};
 
 use super::CALLBACK_STACK_SIZE;
 use super::messages::{Confirmation, StartFfiInfo, TraceRequest};
 use super::parent::{ChildListener, sv_loop};
-use crate::shims::native_lib::MemEvents;
-use crate::shims::native_lib::trace::parent::{PAGE_ADDR, PAGE_COUNT, PAGE_SIZE};
+use crate::alloc_addresses::EvalContextExt as _;
+use crate::helpers::ToU64;
+use crate::shims::alloc::EvalContextExt as _;
+use crate::shims::native_lib::trace::parent::{EVT_RX, SHARED};
+use crate::shims::native_lib::{EvalContextExtPriv, MACHINE_PTR, MemEvents};
 use crate::*;
 
 /// A handle to the single, shared supervisor process across all `MiriMachine`s.
@@ -22,6 +26,10 @@ use crate::*;
 /// This should only contain a `None` if the supervisor has not (yet) been initialised;
 /// otherwise, if `init_sv` was called and did not error, this will always be nonempty.
 static SUPERVISOR: std::sync::Mutex<Option<Supervisor>> = std::sync::Mutex::new(None);
+
+/// Is the supervisor initialised? Sometimes we need to poll this even when the mutex
+/// for its handle is already locked.
+static IS_INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The main means of communication between the child and parent process,
 /// allowing the former to send requests and get info from the latter.
@@ -42,9 +50,10 @@ pub struct SvInitError;
 impl Supervisor {
     /// Returns `true` if the supervisor process exists, and `false` otherwise.
     pub fn is_enabled() -> bool {
-        SUPERVISOR.lock().unwrap().is_some()
+        IS_INIT.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Applies `prot` protections to the addresses given via mprotect.
     pub unsafe fn protect_pages(
         pages: impl Iterator<Item = (NonNull<u8>, usize)>,
         prot: mman::ProtFlags,
@@ -73,7 +82,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // Save the machine pointer to a location where the libc interceptors can use it,
         // since we can't pass in arguments.
-        super::parent::MACHINE_PTR.store(machine_ptr.cast(), std::sync::atomic::Ordering::Relaxed);
+        //MACHINE_PTR.store(machine_ptr.cast(), std::sync::atomic::Ordering::Relaxed);
         // Give the libc interceptors the event channel.
         let mut e_rx = super::parent::EVT_RX.lock().unwrap();
         e_rx.replace(sv.event_rx.take().unwrap());
@@ -137,6 +146,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 )
                 .unwrap();
             }
+            drop(alloc);
 
             // Signal the supervisor that we are done. Will block until the supervisor continues us.
             // This will also shut down the segfault handler, so it's important that all memory is
@@ -215,7 +225,7 @@ pub unsafe fn init_sv() -> Result<(), SvInitError> {
     let (event_tx, event_rx) = ipc::channel().unwrap();
     // SAFETY: Calling sysconf(_SC_PAGESIZE) is always safe and cannot error.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.try_into().unwrap();
-    super::parent::PAGE_SIZE.store(page_size, std::sync::atomic::Ordering::Relaxed);
+    super::parent::SHARED.page_size.store(page_size, std::sync::atomic::Ordering::Relaxed);
 
     unsafe {
         // TODO: Maybe use clone3() instead for better signalling of when the child exits?
@@ -272,6 +282,7 @@ pub unsafe fn init_sv() -> Result<(), SvInitError> {
                 // If we're the child process, save the supervisor info.
                 let event_rx = Some(event_rx);
                 *lock = Some(Supervisor { message_tx, confirm_rx, event_rx });
+                IS_INIT.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -298,41 +309,300 @@ pub fn register_retcode_sv(code: i32) {
 /// `PAGE_SIZE` should be the host pagesize, and the range from `PAGE_ADDR` to
 /// `PAGE_SIZE` * `PAGE_COUNT` must be owned and allocated memory. No other threads
 /// should be running.
-pub unsafe extern "C" fn mempr_off() {
+pub(super) unsafe extern "C" fn mempr_off() {
     // Again, cannot allow unwinds to happen here.
-    let len = PAGE_SIZE.load(Ordering::SeqCst).saturating_mul(PAGE_COUNT.load(Ordering::SeqCst));
+    let len = SHARED
+        .page_size
+        .load(Ordering::SeqCst)
+        .saturating_mul(SHARED.page_count.load(Ordering::SeqCst));
     // SAFETY: Upheld by "caller".
     unsafe {
         // It's up to the caller to make sure this doesn't actually overflow, but
         // we mustn't unwind from here, so...
         if libc::mprotect(
-            PAGE_ADDR.load(Ordering::SeqCst).cast(),
+            SHARED.page_addr.load(Ordering::SeqCst).cast(),
             len,
             libc::PROT_READ | libc::PROT_WRITE,
         ) != 0
         {
             // Can't return or unwind, but we can do this.
-            std::process::exit(-1);
+            std::process::abort();
         }
     }
     // If this fails somehow we're doomed.
     if signal::raise(signal::SIGSTOP).is_err() {
-        std::process::exit(-1);
+        std::process::abort();
     }
 }
 
 /// Reenables protection on the page set by `PAGE_ADDR`.
 ///
 /// SAFETY: See `mempr_off()`.
-pub unsafe extern "C" fn mempr_on() {
-    let len = PAGE_SIZE.load(Ordering::SeqCst).wrapping_mul(PAGE_COUNT.load(Ordering::SeqCst));
+pub(super) unsafe extern "C" fn mempr_on() {
+    let len = SHARED
+        .page_size
+        .load(Ordering::SeqCst)
+        .wrapping_mul(SHARED.page_count.load(Ordering::SeqCst));
     // SAFETY: Upheld by "caller".
     unsafe {
-        if libc::mprotect(PAGE_ADDR.load(Ordering::SeqCst).cast(), len, libc::PROT_NONE) != 0 {
-            std::process::exit(-1);
+        if libc::mprotect(SHARED.page_addr.load(Ordering::SeqCst).cast(), len, libc::PROT_NONE) != 0
+        {
+            std::process::abort();
         }
     }
     if signal::raise(signal::SIGSTOP).is_err() {
-        std::process::exit(-1);
+        std::process::abort();
     }
+}
+
+// Libc interceptors and associated scaffolding. We get dropped into these functions
+// with the stack and all properly set up, so these can be simple extern "C" fns.
+
+pub(super) unsafe extern "C" fn fake_malloc(size: libc::size_t) -> *mut libc::c_void {
+    do_libc_thing(AllocAction::Allocate { size, align: None, zeroed: false }).unwrap()
+}
+
+pub(super) unsafe extern "C" fn fake_calloc(
+    count: libc::size_t,
+    size: libc::size_t,
+) -> *mut libc::c_void {
+    let size = count.strict_mul(size);
+    do_libc_thing(AllocAction::Allocate { size, align: None, zeroed: true }).unwrap()
+}
+
+pub(super) unsafe extern "C" fn fake_aligned_alloc(
+    align: libc::size_t,
+    size: libc::size_t,
+) -> *mut libc::c_void {
+    assert!(align.is_power_of_two() && size.is_multiple_of(align));
+    do_libc_thing(AllocAction::Allocate { size, align: Some(align), zeroed: false }).unwrap()
+}
+
+pub(super) unsafe extern "C" fn fake_posix_memalign(
+    memptr: *mut *mut libc::c_void,
+    align: libc::size_t,
+    size: libc::size_t,
+) -> libc::c_int {
+    if !align.is_power_of_two() {
+        return libc::EINVAL;
+    }
+    let ptr =
+        do_libc_thing(AllocAction::Allocate { size, align: Some(align), zeroed: false }).unwrap();
+    unsafe {
+        // todo: does this explode...
+        *memptr = ptr;
+    }
+    0
+}
+
+pub(super) unsafe extern "C" fn fake_realloc(
+    ptr: *mut libc::c_void,
+    size: libc::size_t,
+) -> *mut libc::c_void {
+    do_libc_thing(AllocAction::Reallocate { ptr, size }).unwrap()
+}
+
+pub(super) unsafe extern "C" fn fake_free(ptr: *mut libc::c_void) {
+    let r = do_libc_thing(AllocAction::Free(ptr));
+    assert!(r.is_none());
+}
+
+#[derive(Clone, Copy)]
+enum AllocAction {
+    Allocate { size: usize, align: Option<usize>, zeroed: bool },
+    Free(*mut libc::c_void),
+    Reallocate { ptr: *mut libc::c_void, size: usize },
+}
+
+/// Wrapper for `do_libc_thing_inner`, handling the possibility of an error
+/// being returned.
+fn do_libc_thing(action: AllocAction) -> Option<*mut libc::c_void> {
+    // Grab the pointer to the MiriInterpCx.
+    let this = unsafe {
+        MACHINE_PTR
+            .load(Ordering::Acquire)
+            .cast::<crate::MiriInterpCx<'_>>()
+            .as_mut()
+            .expect("no machine pointer set")
+    };
+    let ret = match do_libc_thing_inner(this, action).report_err() {
+        Ok(p) => p,
+        Err(e) => {
+            crate::diagnostics::report_result(this, e);
+            std::process::exit(1);
+        }
+    };
+    // Inform the supervisor that we're about to return from the interceptor.
+    signal::raise(signal::SIGSTOP).unwrap();
+    ret
+}
+
+/// Does the actual shimming in a generic way over possible libc functions. For
+/// register clobber reasons, we want this to not get inlined or it could cause
+/// weird behaviour.
+#[inline(never)]
+fn do_libc_thing_inner<'tcx>(
+    this: &mut MiriInterpCx<'tcx>,
+    action: AllocAction,
+) -> InterpResult<'tcx, Option<*mut libc::c_void>> {
+    // Are we returning into libc?
+    let ret_is_libc = SHARED.ret_is_libc.load(Ordering::Relaxed);
+
+    // Grab the list of pages managed by the allocator and unprotect memory in case
+    // it's accessed.
+    let old_pages = this.machine.allocator.as_ref().unwrap().borrow().pages().collect::<Vec<_>>();
+    // SAFETY: We're unprotecting the pages, so this is ok.
+    unsafe {
+        super::Supervisor::protect_pages(
+            old_pages.iter().copied(),
+            mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE,
+        )
+        .unwrap();
+    }
+
+    // Apply all events that have happened thus far on the list of allocations
+    // that existed before this call.
+    let events = EVT_RX.lock().unwrap().as_ref().unwrap().recv().unwrap();
+    this.tracing_apply_accesses(events)?;
+
+    // Reset these values for the supervisor to read.
+    SHARED.new_pages_addr.store(std::ptr::null_mut(), Ordering::Relaxed);
+    SHARED.new_pages_count.store(0, Ordering::Relaxed);
+    SHARED.del_pages_addr.store(std::ptr::null_mut(), Ordering::Relaxed);
+    SHARED.del_pages_count.store(0, Ordering::Relaxed);
+
+    // Did we end up passing through the call to libc?
+    let mut did_libc_call = false;
+
+    let ret = match action {
+        AllocAction::Free(ptr) => {
+            // Like with realloc, if we're freeing outside of our pages just forward
+            // the call to libc itself.
+            if ret_is_libc
+                || !old_pages.iter().any(|(base, len)| {
+                    (base.addr().get()..base.addr().get().strict_add(*len)).contains(&ptr.addr())
+                })
+            {
+                did_libc_call = true;
+                unsafe { libc::free(ptr) }
+            } else {
+                let miri_ptr = crate::Pointer::new(
+                    Some(crate::Provenance::Wildcard),
+                    rustc_abi::Size::from_bytes(ptr.addr()),
+                );
+                this.free(miri_ptr)?;
+            }
+            interp_ok(None)
+        }
+        AllocAction::Allocate { size, .. } | AllocAction::Reallocate { size, .. } => {
+            let retptr = match action {
+                AllocAction::Free(_) => unreachable!(),
+                AllocAction::Allocate { align, zeroed, .. } => {
+                    let align = align
+                        .unwrap_or(this.malloc_align(size.to_u64()).bytes().try_into().unwrap());
+                    if ret_is_libc {
+                        did_libc_call = true;
+                        let mut retptr = std::ptr::null_mut();
+                        let r = unsafe { libc::posix_memalign(&raw mut retptr, align, size) };
+                        assert_eq!(r, 0);
+                        if zeroed {
+                            unsafe { std::ptr::write_bytes(retptr, 0, size) }
+                        };
+                        Err(retptr)
+                    } else {
+                        let init = if zeroed { AllocInit::Zero } else { AllocInit::Uninit };
+                        Ok(this
+                            .allocate_ptr(
+                                Size::from_bytes(size),
+                                Align::from_bytes(align.to_u64()).unwrap(), // fixme
+                                MemoryKind::Machine(MiriMemoryKind::C),
+                                init,
+                            )?
+                            .into())
+                    }
+                }
+                AllocAction::Reallocate { ptr, .. } => {
+                    // Don't do a `ptr_from_addr_cast`, since it might print an extraneous warning.
+                    let miri_ptr = crate::Pointer::new(
+                        Some(crate::Provenance::Wildcard),
+                        rustc_abi::Size::from_bytes(ptr.addr()),
+                    );
+
+                    if ret_is_libc
+                        // If we're returning into libc or the original pointer wasn't
+                        // in our pages, pass this forward to libc.
+                        || !old_pages.iter().any(|(base, len)| {
+                            (base.addr().get()..base.addr().get().strict_add(*len)).contains(&ptr.addr())
+                        })
+                    {
+                        did_libc_call = true;
+                        Err(unsafe { libc::realloc(ptr, size) })
+                    } else {
+                        // Otherwise do it with our allocator.
+                        Ok(this.realloc(miri_ptr, size.to_u64())?)
+                    }
+                }
+            };
+            match retptr {
+                Ok(retptr) => {
+                    // This pointer is instantiated in foreign code, so it should
+                    // be assumed to be exposed from the start.
+                    this.expose_provenance(retptr.provenance.unwrap())?;
+                    // We want to get the actual *mut T pointer, not just cast the address
+                    // from it, to avoid having UB in this handler.
+                    let (id, ..) = this.ptr_get_alloc_id(retptr, size.try_into().unwrap())?;
+                    let ret = this.get_alloc_raw_mut(id)?.0.get_bytes_unchecked_raw_mut();
+                    std::hint::black_box(ret.expose_provenance());
+                    interp_ok(Some(ret.cast::<libc::c_void>()))
+                }
+                Err(retptr) => interp_ok(Some(retptr)),
+            }
+        }
+    };
+
+    // We always need to pass the call to libc proper if we're returning to it,
+    // so make sure we didn't make a mistake in our code.
+    if ret_is_libc {
+        assert!(did_libc_call);
+    }
+
+    // Pages to reprotect.
+    let prot_pages = if did_libc_call {
+        old_pages
+    } else {
+        // If the call was forwarded, this is unnecessary since it'll do nothing so skip it.
+        let new_pages =
+            this.machine.allocator.as_ref().unwrap().borrow().pages().collect::<Vec<_>>();
+
+        let mut new_count = 0u32;
+        for pgs in &new_pages {
+            if !old_pages.contains(pgs) {
+                SHARED.new_pages_addr.store(pgs.0.as_ptr().cast(), Ordering::Relaxed);
+                SHARED.new_pages_count.store(pgs.1, Ordering::Relaxed);
+                new_count = new_count.strict_add(1);
+            }
+        }
+        assert!(new_count <= 1);
+
+        let mut del_count = 0u32;
+        for pgs in &old_pages {
+            if !new_pages.contains(pgs) {
+                SHARED.del_pages_addr.store(pgs.0.as_ptr().cast(), Ordering::Relaxed);
+                SHARED.del_pages_count.store(pgs.1, Ordering::Relaxed);
+                del_count = del_count.strict_add(1);
+            }
+        }
+        assert!(del_count <= 1);
+        new_pages
+    };
+
+    // SAFETY: We're going back into the FFI call proper, so we want accesses
+    // logged again.
+    unsafe {
+        super::Supervisor::protect_pages(prot_pages.into_iter(), mman::ProtFlags::PROT_NONE)
+            .unwrap()
+    };
+
+    ret
+    //interp_ok(ret)
 }

@@ -22,9 +22,11 @@ const ARCH_WORD_SIZE: usize = 8;
 // x86 max instruction length is 15 bytes:
 // https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
 // See vol. 3B section 24.25.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const ARCH_MAX_INSTR_SIZE: usize = 15;
 
-/// Opcode for an instruction to raise SIGTRAP, to be written in the child process.
+/// Opcode for an instruction to raise SIGTRAP (set a breakpoint), to be written
+/// in the child process.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const BREAKPT_INSTR: i16 = 0xCC;
 
@@ -32,36 +34,49 @@ const BREAKPT_INSTR: i16 = 0xCC;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const BREAKPT_INSTR_SIZE: usize = 1;
 
-/// The host pagesize, initialised to a sentinel zero value.
-pub static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
-/// The address of the page set to be edited, initialised to a sentinel null
-/// pointer.
-pub(super) static PAGE_ADDR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-/// How many consecutive pages to unprotect. 1 by default, unlikely to be set
-/// higher than 2.
-pub(super) static PAGE_COUNT: AtomicUsize = AtomicUsize::new(1);
-/// A pointer to the `MiriInterpCx` for use within the libc shims.
-pub(super) static MACHINE_PTR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-/// Is the return address within the libc-mapped area(s)?
-pub(super) static RET_IS_LIBC: AtomicBool = AtomicBool::new(false);
-
-/// Information about which pages were allocated/deallocated after a single
-/// libc intercepted event. After use, these are reset to 0.
-///
-/// INVARIANT: A single libc event can only allocate/deallocate one contiguous
-/// block of pages (as would be the case in a large `realloc`).
-pub(super) static NEW_PAGES_ADDR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-pub(super) static NEW_PAGES_COUNT: AtomicUsize = AtomicUsize::new(0);
-pub(super) static DEL_PAGES_ADDR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-pub(super) static DEL_PAGES_COUNT: AtomicUsize = AtomicUsize::new(0);
-
 /// The `event_rx` channel from the supervisor struct. The libc interceptors must
 /// know which accesses happened before they were triggered, so e.g. an access in
 /// an allocation that was later freed before the FFI call returned doesn't mistakenly
 /// get marked as incorrect.
 pub(super) static EVT_RX: sync::Mutex<Option<ipc::IpcReceiver<MemEvents>>> = sync::Mutex::new(None);
 
-/// Allows us to get common arguments from the `user_regs_t` across architectures.
+/// Information that the supervisor and child processes communicate through a
+/// preset static.
+pub(super) struct SharedData {
+    /// The host pagesize, initialised to a sentinel zero value.
+    pub(super) page_size: AtomicUsize,
+    /// The address of the page set to be edited, initialised to a sentinel null
+    /// pointer.
+    pub(super) page_addr: AtomicPtr<()>,
+    /// How many consecutive pages to unprotect. 1 by default, unlikely to be set
+    /// higher than 2.
+    pub(super) page_count: AtomicUsize,
+    /// Is the return address within the libc-mapped area(s)?
+    pub(super) ret_is_libc: AtomicBool,
+
+    /// Information about which pages were allocated/deallocated after a single
+    /// libc intercepted event. After use, these are reset to 0.
+    ///
+    /// INVARIANT: A single libc event can only allocate/deallocate one contiguous
+    /// block of pages (as would be the case in a large `realloc`).
+    pub(super) new_pages_addr: AtomicPtr<()>,
+    pub(super) new_pages_count: AtomicUsize,
+    pub(super) del_pages_addr: AtomicPtr<()>,
+    pub(super) del_pages_count: AtomicUsize,
+}
+
+pub(super) static SHARED: SharedData = SharedData {
+    page_size: AtomicUsize::new(0),
+    page_addr: AtomicPtr::new(std::ptr::null_mut()),
+    page_count: AtomicUsize::new(1),
+    ret_is_libc: AtomicBool::new(false),
+    new_pages_addr: AtomicPtr::new(std::ptr::null_mut()),
+    new_pages_count: AtomicUsize::new(0),
+    del_pages_addr: AtomicPtr::new(std::ptr::null_mut()),
+    del_pages_count: AtomicUsize::new(0),
+};
+
+/// Allows us to get common arguments from the `user_regs_struct` across architectures.
 /// Normally this would land us ABI hell, but thankfully all of our usecases
 /// consist of functions with a small number of register-sized integer arguments.
 /// See <https://man7.org/linux/man-pages/man2/syscall.2.html> for sources.
@@ -75,6 +90,8 @@ trait ArchIndependentRegs {
     fn set_ip(&mut self, ip: usize);
     /// Set the stack pointer, ideally to a zeroed-out area.
     fn set_sp(&mut self, sp: usize);
+    /// Gets the value of the register with this name, if any.
+    fn val_of_name(&self, name: Option<&String>) -> Option<usize>;
 }
 
 // It's fine / desirable behaviour for values to wrap here, we care about just
@@ -90,6 +107,31 @@ impl ArchIndependentRegs for libc::user_regs_struct {
     fn set_ip(&mut self, ip: usize) { self.rip = ip.try_into().unwrap() }
     #[inline]
     fn set_sp(&mut self, sp: usize) { self.rsp = sp.try_into().unwrap() }
+    fn val_of_name(&self, name: Option<&String>) -> Option<usize> {
+        // Maybe reflection isn't the worst thing to have...
+        match name?.as_str() {
+            // todo: fill in more, other architectures too........
+            "rax" => Some(self.rax.try_into().unwrap()),
+            "rbp" => Some(self.rbp.try_into().unwrap()),
+            "rbx" => Some(self.rbx.try_into().unwrap()),
+            "rcx" => Some(self.rcx.try_into().unwrap()),
+            "rdi" => Some(self.rdi.try_into().unwrap()),
+            "rdx" => Some(self.rdx.try_into().unwrap()),
+            "rip" => Some(self.rip.try_into().unwrap()),
+            "rsi" => Some(self.rsi.try_into().unwrap()),
+            "rsp" => Some(self.rsp.try_into().unwrap()),
+            "r8" => Some(self.r8.try_into().unwrap()),
+            "r9" => Some(self.r9.try_into().unwrap()),
+            "r10" => Some(self.r10.try_into().unwrap()),
+            "r11" => Some(self.r11.try_into().unwrap()),
+            "r12" => Some(self.r12.try_into().unwrap()),
+            "r13" => Some(self.r13.try_into().unwrap()),
+            "r14" => Some(self.r14.try_into().unwrap()),
+            "r15" => Some(self.r15.try_into().unwrap()),
+            "ss" => Some(self.ss.try_into().unwrap()),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(target_arch = "x86")]
@@ -103,12 +145,27 @@ impl ArchIndependentRegs for libc::user_regs_struct {
     fn set_ip(&mut self, ip: usize) { self.eip = ip.cast_signed().try_into().unwrap() }
     #[inline]
     fn set_sp(&mut self, sp: usize) { self.esp = sp.cast_signed().try_into().unwrap() }
+    fn val_of_name(&self, name: Option<&String>) -> Option<usize> {
+        match name?.as_str() {
+            "eax" => Some(self.eax.cast_unsigned().try_into().unwrap()),
+            "ebp" => Some(self.ebp.cast_unsigned().try_into().unwrap()),
+            "ebx" => Some(self.ebx.cast_unsigned().try_into().unwrap()),
+            "ecx" => Some(self.ecx.cast_unsigned().try_into().unwrap()),
+            "edi" => Some(self.edi.cast_unsigned().try_into().unwrap()),
+            "edx" => Some(self.edx.cast_unsigned().try_into().unwrap()),
+            "eip" => Some(self.eip.cast_unsigned().try_into().unwrap()),
+            "esi" => Some(self.esi.cast_unsigned().try_into().unwrap()),
+            "esp" => Some(self.esp.cast_unsigned().try_into().unwrap()),
+            "xss" => Some(self.xss.cast_unsigned().try_into().unwrap()),
+            _ => None,
+        }
+    }
 }
 
 /// A unified event representing something happening on the child process. Wraps
 /// `nix`'s `WaitStatus` and our custom signals so it can all be done with one
 /// `match` statement.
-pub enum ExecEvent {
+pub(super) enum ExecEvent {
     /// Child process requests that we begin monitoring it.
     Start(StartFfiInfo),
     /// Child requests that we stop monitoring and pass over the events we
@@ -124,7 +181,7 @@ pub enum ExecEvent {
 }
 
 /// A listener for the FFI start info channel along with relevant state.
-pub struct ChildListener {
+pub(super) struct ChildListener {
     /// The matching channel for the child's `Supervisor` struct.
     message_rx: ipc::IpcReceiver<TraceRequest>,
     /// ...
@@ -138,7 +195,7 @@ pub struct ChildListener {
 }
 
 impl ChildListener {
-    pub fn new(
+    pub(super) fn new(
         message_rx: ipc::IpcReceiver<TraceRequest>,
         confirm_tx: ipc::IpcSender<Confirmation>,
     ) -> Self {
@@ -221,7 +278,7 @@ impl Iterator for ChildListener {
 /// An error came up while waiting on the child process to do something.
 /// It likely died, with this return code if we have one.
 #[derive(Debug)]
-pub struct ExecEnd(pub Option<i32>);
+pub(super) struct ExecEnd(pub(super) Option<i32>);
 
 /// Whether to call `ptrace::cont()` immediately. Used exclusively by `wait_for_signal`.
 enum InitialCont {
@@ -232,14 +289,14 @@ enum InitialCont {
 /// This is the main loop of the supervisor process. It runs in a separate
 /// process from the rest of Miri (but because we fork, addresses for anything
 /// created before the fork - like statics - are the same).
-pub fn sv_loop(
+pub(super) fn sv_loop(
     listener: ChildListener,
     init_pid: unistd::Pid,
     event_tx: ipc::IpcSender<MemEvents>,
     confirm_tx: ipc::IpcSender<Confirmation>,
 ) -> Result<!, ExecEnd> {
     // Get the pagesize set and make sure it isn't still on the zero sentinel value!
-    let page_size = PAGE_SIZE.load(Ordering::Relaxed);
+    let page_size = SHARED.page_size.load(Ordering::Relaxed);
     assert_ne!(page_size, 0);
 
     // Things that we return to the child process.
@@ -257,7 +314,7 @@ pub fn sv_loop(
     let mut curr_pid = init_pid;
 
     // There's an initial sigstop we need to deal with.
-    wait_for_signal(Some(curr_pid), signal::SIGSTOP, InitialCont::No, None)?;
+    wait_for_signal(Some(curr_pid), signal::SIGSTOP, InitialCont::No, CatchSegfaults::No)?;
     ptrace::cont(curr_pid, None).unwrap();
 
     for evt in listener {
@@ -276,7 +333,9 @@ pub fn sv_loop(
                 confirm_tx.send(Confirmation).unwrap();
                 // We can't trust simply calling `Pid::this()` in the child process to give the right
                 // PID for us, so we get it this way.
-                curr_pid = wait_for_signal(None, signal::SIGSTOP, InitialCont::No, None).unwrap();
+                curr_pid =
+                    wait_for_signal(None, signal::SIGSTOP, InitialCont::No, CatchSegfaults::No)
+                        .unwrap();
                 // Intercept libc events we care about.
                 trap_libc(curr_pid);
                 // Continue until next syscall.
@@ -333,7 +392,7 @@ pub fn sv_loop(
     unreachable!()
 }
 
-/// Set up SIGTRAPs on the first few bytes of malloc/free/etc.
+/// Set up breakpoints on the first few bytes of malloc/free/etc.
 #[expect(clippy::as_conversions)]
 fn trap_libc(pid: unistd::Pid) {
     ptrace::write(pid, libc::malloc as *mut _, BREAKPT_INSTR.into()).unwrap();
@@ -399,11 +458,18 @@ fn get_disasm() -> capstone::Capstone {
     .unwrap()
 }
 
-struct SegfaultCatchingStuff<'a, 'b, 'c> {
+/// Necessary data for `catch_segfaults()` to log accesses and determine if they
+/// are allowed.
+struct SegfaultCatchingParams<'a, 'b, 'c> {
     ch_pages: &'a [usize],
     ch_stack: usize,
     cs: &'b capstone::Capstone,
     acc_events: &'c mut Vec<AccessEvent>,
+}
+
+enum CatchSegfaults<'a, 'b, 'c> {
+    Yes(SegfaultCatchingParams<'a, 'b, 'c>),
+    No,
 }
 
 /// Waits for `wait_signal`. If `init_cont`, it will first do a `ptrace::cont`.
@@ -414,7 +480,7 @@ fn wait_for_signal(
     pid: Option<unistd::Pid>,
     wait_signal: signal::Signal,
     init_cont: InitialCont,
-    mut catch_segfaults: Option<SegfaultCatchingStuff<'_, '_, '_>>,
+    mut catch_segfaults: CatchSegfaults<'_, '_, '_>,
 ) -> Result<unistd::Pid, ExecEnd> {
     if matches!(init_cont, InitialCont::Yes) {
         ptrace::cont(pid.unwrap(), None).unwrap();
@@ -443,7 +509,7 @@ fn wait_for_signal(
         };
         if signal == wait_signal {
             return Ok(pid);
-        } else if let Some(ref mut sf) = catch_segfaults
+        } else if let CatchSegfaults::Yes(ref mut sf) = catch_segfaults
             && signal == signal::SIGSEGV
         {
             // Segfaults occuring during a wait should still be logged.
@@ -457,20 +523,36 @@ fn wait_for_signal(
 /// Add the memory events from `op` being executed while there is a memory access at `addr` to
 /// `acc_events`. Return whether this was a memory operand.
 fn capstone_find_events(
-    addr: usize,
+    cs: &capstone::Capstone,
     op: &capstone::arch::ArchOperand,
-    acc_events: &mut Vec<AccessEvent>,
-) -> bool {
+    regs: &libc::user_regs_struct,
+) -> Vec<AccessEvent> {
     use capstone::prelude::*;
     match op {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         arch::ArchOperand::X86Operand(x86_operand) => {
             match x86_operand.op_type {
                 // We only care about memory accesses
-                arch::x86::X86OperandType::Mem(_) => {
+                arch::x86::X86OperandType::Mem(mem_op) => {
+                    let base_addr = regs
+                        .val_of_name(cs.reg_name(mem_op.base()).as_ref())
+                        .expect("cannot get base addr of reg");
+
+                    // This isn't present on all instructions. `scale` on x86 is always
+                    // 1, 2, 4, or 8 (or possibly 0 if `idx` is an invalid register).
+                    let idx_val = regs
+                        .val_of_name(cs.reg_name(mem_op.index()).as_ref())
+                        .unwrap_or(0)
+                        .wrapping_mul(mem_op.scale().try_into().unwrap());
+                    let addr = base_addr
+                        .wrapping_add(idx_val)
+                        .wrapping_add_signed(mem_op.disp().try_into().unwrap());
+
                     let push = AccessRange { addr, size: x86_operand.size.into() };
+
                     // It's called a "RegAccessType" but it also applies to memory
                     let acc_ty = x86_operand.access.unwrap();
+                    let mut acc_events = vec![];
                     // The same instruction might do both reads and writes, so potentially add both.
                     // We do not know the order in which they happened, but writing and then reading
                     // makes little sense so we put the read first. That is also the more
@@ -492,46 +574,33 @@ fn capstone_find_events(
                         acc_events.push(AccessEvent::Write(push, !acc_ty.is_readable()));
                     }
 
-                    return true;
+                    acc_events
                 }
-                _ => (),
+                _ => vec![],
             }
         }
     }
-
-    false
 }
 
 /// Extract the events from the given instruction.
 fn capstone_disassemble(
     instr: &[u8],
-    addr: usize,
     cs: &capstone::Capstone,
-    acc_events: &mut Vec<AccessEvent>,
-) -> capstone::CsResult<()> {
+    regs: &libc::user_regs_struct,
+) -> capstone::CsResult<Vec<AccessEvent>> {
     // The arch_detail is what we care about, but it relies on these temporaries
     // that we can't drop. 0x1000 is the default base address for Captsone, and
     // we're expecting 1 instruction.
     let insns = cs.disasm_count(instr, 0x1000, 1)?;
     let ins_detail = cs.insn_detail(&insns[0])?;
     let arch_detail = ins_detail.arch_detail();
-
-    let mut found_mem_op = false;
-
-    for op in arch_detail.operands() {
-        if capstone_find_events(addr, &op, acc_events) {
-            if found_mem_op {
-                panic!("more than one memory operand found; we don't know which one accessed what");
-            }
-            found_mem_op = true;
-        }
-    }
-
-    Ok(())
+    //dbg!(insns[0].op_str());
+    Ok(arch_detail
+        .operands()
+        .iter()
+        .flat_map(|op| capstone_find_events(cs, op, regs))
+        .collect::<Vec<_>>())
 }
-
-// THIS NEEDS TO SOMEHOW CATCH SEGFAULTS INSIDE IT!!!! AND ALSO IN THE FULL ONE IT
-// NEEDS TO GET THEM TO LOG THOSE ACCESSES AAAAAAAAAAAAAAAAA
 
 /// Grabs the access that caused a segfault and logs it down if it's to our memory,
 /// or kills the child and returns the appropriate error otherwise.
@@ -542,25 +611,11 @@ fn handle_segfault(
     cs: &capstone::Capstone,
     acc_events: &mut Vec<AccessEvent>,
 ) -> Result<(), ExecEnd> {
-    let page_size = PAGE_SIZE.load(Ordering::Relaxed);
-    // Get information on what caused the segfault. This contains the address
-    // that triggered it.
-    let siginfo = ptrace::getsiginfo(pid).unwrap();
-    // All x86 instructions only have at most one memory operand (thankfully!)
-    // SAFETY: si_addr is safe to call.
-    let addr = unsafe { siginfo.si_addr().addr() };
-    let page_addr = addr.strict_sub(addr.strict_rem(page_size));
+    //let siginfo = ptrace::getsiginfo(pid).unwrap();
+    //let sig_addr = unsafe { siginfo.si_addr().addr() };
+    //eprintln!("sig_addr: {sig_addr:#0x?}");
 
-    if !ch_pages.iter().any(|pg| (*pg..pg.strict_add(page_size)).contains(&addr)) {
-        // This was a real segfault (not one of the Miri memory pages), so print some debug info and
-        // quit.
-        let regs = ptrace::getregs(pid).unwrap();
-        eprintln!("Segfault occurred during FFI at {addr:#018x}");
-        eprintln!("Expected access on pages: {ch_pages:#018x?}");
-        eprintln!("Register dump: {regs:#x?}");
-        ptrace::kill(pid).unwrap();
-        return Err(ExecEnd(None));
-    }
+    let page_size = SHARED.page_size.load(Ordering::Relaxed);
 
     // Overall structure:
     // - Get the address that caused the segfault
@@ -570,11 +625,6 @@ fn handle_segfault(
     // - Parse executed code to estimate size & type of access
     // - Reprotect the memory by executing `mempr_on` in the child, using the callback stack again.
     // - Continue
-
-    // Ensure the stack is properly zeroed out!
-    for a in (ch_stack..ch_stack.strict_add(CALLBACK_STACK_SIZE)).step_by(ARCH_WORD_SIZE) {
-        ptrace::write(pid, std::ptr::with_exposed_provenance_mut(a), 0).unwrap();
-    }
 
     // Guard against both architectures with upwards and downwards-growing stacks.
     let stack_ptr = ch_stack.strict_add(CALLBACK_STACK_SIZE / 2);
@@ -600,36 +650,91 @@ fn handle_segfault(
         .collect::<Vec<_>>();
 
     // Now figure out the size + type of access and log it down.
-    capstone_disassemble(&instr, addr, cs, acc_events).expect("Failed to disassemble instruction");
+    let accessed_addrs =
+        capstone_disassemble(&instr, cs, &regs_bak).expect("Failed to disassemble instruction");
+    assert!(accessed_addrs.len() > 0);
 
-    // Move the instr ptr into the deprotection code.
-    #[expect(clippy::as_conversions)]
-    new_regs.set_ip(super::child::mempr_off as *const () as usize);
-    // Don't mess up the stack by accident!
-    new_regs.set_sp(stack_ptr);
+    // Filter out cases with two memory operands where only one address is in our addr space.
+    // todo: it's possible *both* addresses raised segfaults, that should be checked somehow!
+    // We are also assuming an access won't start in a different page we don't own and cross
+    // over into ours.
+    let accessed_addrs_ours = accessed_addrs
+        .iter()
+        .filter(|&a| {
+            ch_pages.iter().any(|&pg| (pg..pg.strict_add(page_size)).contains(&a.base_addr()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if accessed_addrs_ours.len() == 0 {
+        let regs = ptrace::getregs(pid).unwrap();
+        // Remove addrs in our addr space, since those are fine to access.
+        let bad_addrs = accessed_addrs
+            .iter()
+            .filter(|&a| !accessed_addrs_ours.contains(a))
+            .cloned()
+            .collect::<Vec<_>>();
+        eprintln!("Segfault occurred during FFI at {bad_addrs:#018x?}");
+        // todo: do we still want to print this? it can be spammy.
+        //eprintln!("Expected access on pages: {ch_pages:#018x?}");
+        eprintln!("Register dump: {regs:#x?}");
+        ptrace::kill(pid).unwrap();
+        return Err(ExecEnd(None));
+    }
 
-    // Modify the PAGE_ADDR global on the child process to point to the page
-    // that we want unprotected.
-    ptrace::write(
-        pid,
-        (&raw const PAGE_ADDR).cast_mut().cast(),
-        libc::c_long::try_from(page_addr.cast_signed()).unwrap(),
-    )
-    .unwrap();
+    // Log down the accesses that did happen.
+    // todo: stable-sort this so reads all go at the start without changing their
+    // order relative to each other.
+    for acc in &accessed_addrs_ours {
+        acc_events.push(acc.clone());
+    }
 
-    // Check if we also own the next page, and if so unprotect it in case
-    // the access spans the page boundary.
-    let flag = if ch_pages.contains(&page_addr.strict_add(page_size)) { 2 } else { 1 };
-    ptrace::write(pid, (&raw const PAGE_COUNT).cast_mut().cast(), flag).unwrap();
+    // We need the address and size twice below, so might as well compute these ahead of time.
+    let prot_stuff_iter = accessed_addrs_ours
+        .iter()
+        .map(|a| {
+            let addr = a.base_addr();
+            let flag = if ch_pages.contains(&addr.strict_add(page_size)) { 2i64 } else { 1i64 };
+            (addr, flag)
+        })
+        .collect::<Vec<_>>();
 
-    ptrace::setregs(pid, new_regs).unwrap();
+    // Deprotect memory to allow the access(es) to retry.
+    for (addr, flag) in &prot_stuff_iter {
+        // Zero the stack out every time.
+        for a in (ch_stack..ch_stack.strict_add(CALLBACK_STACK_SIZE)).step_by(ARCH_WORD_SIZE) {
+            ptrace::write(pid, std::ptr::with_exposed_provenance_mut(a), 0).unwrap();
+        }
 
-    // Our mempr_* functions end with a raise(SIGSTOP).
-    wait_for_signal(Some(pid), signal::SIGSTOP, InitialCont::Yes, None)?;
+        // Move the instr ptr into the deprotection code.
+        #[expect(clippy::as_conversions)]
+        new_regs.set_ip(super::child::mempr_off as *const () as usize);
+        // Don't mess up the stack by accident!
+        new_regs.set_sp(stack_ptr);
+
+        // Modify the PAGE_ADDR global on the child process to point to the page
+        // that we want unprotected.
+        let page_addr = addr.strict_sub(addr.strict_rem(page_size)).cast_signed();
+        ptrace::write(
+            pid,
+            (&raw const SHARED.page_addr).cast_mut().cast(),
+            libc::c_long::try_from(page_addr).unwrap(),
+        )
+        .unwrap();
+
+        // Check if we also own the next page, and if so unprotect it in case
+        // the access spans the page boundary.
+        ptrace::write(pid, (&raw const SHARED.page_count).cast_mut().cast(), *flag).unwrap();
+
+        ptrace::setregs(pid, new_regs).unwrap();
+
+        // Our mempr_* functions end with a raise(SIGSTOP).
+        wait_for_signal(Some(pid), signal::SIGSTOP, InitialCont::Yes, CatchSegfaults::No)?;
+    }
 
     // Step 1 instruction.
     ptrace::setregs(pid, regs_bak).unwrap();
     ptrace::step(pid, None).unwrap();
+
     // Don't use wait_for_signal here since 1 instruction doesn't give room
     // for any uncertainty + we don't want it `cont()`ing randomly by accident
     // Also, don't let it continue with unprotected memory if something errors!
@@ -646,32 +751,45 @@ fn handle_segfault(
         _ => (),
     }
 
-    // Zero out again to be safe
-    for a in (ch_stack..ch_stack.strict_add(CALLBACK_STACK_SIZE)).step_by(ARCH_WORD_SIZE) {
-        ptrace::write(pid, std::ptr::with_exposed_provenance_mut(a), 0).unwrap();
-    }
-
     let regs_bak = ptrace::getregs(pid).unwrap();
     new_regs = regs_bak;
 
     // Reprotect everything and continue.
-    #[expect(clippy::as_conversions)]
-    new_regs.set_ip(super::child::mempr_on as *const () as usize);
-    new_regs.set_sp(stack_ptr);
-    ptrace::setregs(pid, new_regs).unwrap();
-    wait_for_signal(Some(pid), signal::SIGSTOP, InitialCont::Yes, None)?;
+    for (addr, flag) in &prot_stuff_iter {
+        // Zero out again to be safe.
+        for a in (ch_stack..ch_stack.strict_add(CALLBACK_STACK_SIZE)).step_by(ARCH_WORD_SIZE) {
+            ptrace::write(pid, std::ptr::with_exposed_provenance_mut(a), 0).unwrap();
+        }
+
+        // Again, modify PAGE_ADDR.
+        let page_addr = addr.strict_sub(addr.strict_rem(page_size)).cast_signed();
+        ptrace::write(
+            pid,
+            (&raw const SHARED.page_addr).cast_mut().cast(),
+            libc::c_long::try_from(page_addr).unwrap(),
+        )
+        .unwrap();
+
+        ptrace::write(pid, (&raw const SHARED.page_count).cast_mut().cast(), *flag).unwrap();
+
+        #[expect(clippy::as_conversions)]
+        new_regs.set_ip(super::child::mempr_on as *const () as usize);
+        new_regs.set_sp(stack_ptr);
+        ptrace::setregs(pid, new_regs).unwrap();
+        wait_for_signal(Some(pid), signal::SIGSTOP, InitialCont::Yes, CatchSegfaults::No)?;
+    }
 
     ptrace::setregs(pid, regs_bak).unwrap();
     ptrace::syscall(pid, None).unwrap();
     Ok(())
 }
 
-/// Determines what libc function was called that caused a sigtrap, giving control
+/// Determines what libc function was called that hit a breakpoint, giving control
 /// to our shims to handle it instead.
 fn handle_sigtrap(
     pid: unistd::Pid,
     pages: &mut Vec<usize>,
-    _event_tx: &ipc::IpcSender<MemEvents>,
+    event_tx: &ipc::IpcSender<MemEvents>,
     acc_events: &mut Vec<AccessEvent>,
     ch_stack: usize,
     cs: &capstone::Capstone,
@@ -684,6 +802,21 @@ fn handle_sigtrap(
         PosixMemalign,
         Realloc,
         Free,
+    }
+
+    impl LibcFn {
+        /// Grabs the address of the matching shim function.
+        fn shim_addr(&self) -> usize {
+            #[expect(clippy::as_conversions)]
+            match self {
+                LibcFn::Malloc => super::child::fake_malloc as *const () as usize,
+                LibcFn::Calloc => super::child::fake_calloc as *const () as usize,
+                LibcFn::AlignedAlloc => super::child::fake_aligned_alloc as *const () as usize,
+                LibcFn::PosixMemalign => super::child::fake_posix_memalign as *const () as usize,
+                LibcFn::Realloc => super::child::fake_realloc as *const () as usize,
+                LibcFn::Free => super::child::fake_free as *const () as usize,
+            }
+        }
     }
 
     /// Gets the libc function that a given instruction pointer corresponds to.
@@ -701,14 +834,15 @@ fn handle_sigtrap(
         }
     }
 
-    let page_size = PAGE_SIZE.load(Ordering::Relaxed);
-    let regs = ptrace::getregs(pid).unwrap();
+    let page_size = SHARED.page_size.load(Ordering::Relaxed);
+    let mut regs = ptrace::getregs(pid).unwrap();
     match get_libc_fn(regs.ip()) {
-        Some(_) => {
+        Some(f) => {
             // We'll possibly want to call libc functions in the interceptor shims,
             // so make sure they're working.
             fixup_libc(pid);
             // On x86, the return address will be the last item on the stack.
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             let ret_addr: usize = ptrace::read(pid, std::ptr::without_provenance_mut(regs.sp()))
                 .unwrap()
                 .cast_unsigned()
@@ -719,6 +853,7 @@ fn handle_sigtrap(
             // intercept them; therefore, we parse the process maps to determine
             // whether this is happening.
             let child_mappings = proc_maps::get_process_maps(pid.as_raw()).unwrap();
+
             // We know for sure libc functions are mapped *somewhere*, and they will be in a file
             // (unless something has gone awfully wrong).
             let libc_name = child_mappings
@@ -733,6 +868,7 @@ fn handle_sigtrap(
                 .unwrap()
                 .filename()
                 .unwrap();
+
             // Is the return address inside of a block mapped from the same
             // file as libc functions?
             let ret_is_libc = child_mappings.iter().any(|mp| {
@@ -742,23 +878,55 @@ fn handle_sigtrap(
                     false
                 }
             });
-            ptrace::write(pid, RET_IS_LIBC.as_ptr().cast(), ret_is_libc.into()).unwrap();
 
-            // Override the return address to give us another sigtrap
+            // Accesses are word-sized, but an AtomicBool is only a single byte. The other atomics we set over
+            // ptrace are all word/pointer-sized themselves, but here we might accidentally write zeroes in
+            // the wrong place if we directly cast the bool to a c_long.
+            let mut data =
+                ptrace::read(pid, SHARED.ret_is_libc.as_ptr().cast()).unwrap().to_ne_bytes();
+            data[0] = ret_is_libc.into();
+            ptrace::write(
+                pid,
+                SHARED.ret_is_libc.as_ptr().cast(),
+                libc::c_long::from_ne_bytes(data),
+            )
+            .unwrap();
+
+            // Send the access events over the channel, since the interceptors will handle these.
+            event_tx.send(MemEvents { acc_events: std::mem::take(acc_events) }).unwrap();
+
+            // Now move into our shim and wait for it to return (via sigtrap).
+            regs.set_ip(f.shim_addr());
+            ptrace::setregs(pid, regs).unwrap();
+
+            let catch_segfaults =
+                SegfaultCatchingParams { ch_pages: &*pages, ch_stack, cs, acc_events };
+
+            // Wait for the sigstop at the end of do_libc_thing. We need to do this
+            // first, else if the function that triggered this intercept is called
+            // within the body of do_libc_thing_inner it'll again hit a breakpoint.
+            // This can abort and error intentionally, e.g. if the call causes UB!
+            // TODO: This should probably only log writes & not reads, since reads
+            // in these functions will never expose provenance to the rest of the native
+            // code. However, these functions likely won't even do any reads, so...
+            wait_for_signal(
+                Some(pid),
+                signal::SIGSTOP,
+                InitialCont::Yes,
+                CatchSegfaults::Yes(catch_segfaults),
+            )?;
+
+            // Override the memory at the return address to set a breakpoint
             // (but save the original bytes).
             let ret_addr_bytes =
                 ptrace::read(pid, std::ptr::without_provenance_mut(ret_addr)).unwrap();
             ptrace::write(pid, std::ptr::without_provenance_mut(ret_addr), BREAKPT_INSTR.into())
                 .unwrap();
-            let catch_segfaults =
-                SegfaultCatchingStuff { ch_pages: &*pages, ch_stack, cs, acc_events };
-            // TODO: This should probably only log writes & not reads, since reads
-            // in these functions will never expose provenance to the rest of the native
-            // code. However, these functions likely won't even do any reads, so...
-            wait_for_signal(Some(pid), signal::SIGTRAP, InitialCont::Yes, Some(catch_segfaults))
+
+            wait_for_signal(Some(pid), signal::SIGTRAP, InitialCont::Yes, CatchSegfaults::No)
                 .unwrap();
 
-            // Unset the breakpoint stuff and move the ip back an instruction to compensate.
+            // Unset the breakpoint setting above and move the ip back an instruction to compensate.
             ptrace::write(pid, std::ptr::without_provenance_mut(ret_addr), ret_addr_bytes).unwrap();
             let mut regs = ptrace::getregs(pid).unwrap();
             regs.set_ip(regs.ip().strict_sub(BREAKPT_INSTR_SIZE));
@@ -766,13 +934,13 @@ fn handle_sigtrap(
 
             // If the intercept modified the list of pages we need to monitor,
             // update our list accordingly.
-            let new_pg_addr: usize = ptrace::read(pid, NEW_PAGES_ADDR.as_ptr().cast())
+            let new_pg_addr: usize = ptrace::read(pid, SHARED.new_pages_addr.as_ptr().cast())
                 .unwrap()
                 .cast_unsigned()
                 .try_into()
                 .unwrap();
             if new_pg_addr != 0 {
-                let new_pg_count: usize = ptrace::read(pid, NEW_PAGES_COUNT.as_ptr().cast())
+                let new_pg_count: usize = ptrace::read(pid, SHARED.new_pages_count.as_ptr().cast())
                     .unwrap()
                     .cast_unsigned()
                     .try_into()
@@ -782,13 +950,13 @@ fn handle_sigtrap(
                 }
             }
 
-            let del_pg_addr: usize = ptrace::read(pid, DEL_PAGES_ADDR.as_ptr().cast())
+            let del_pg_addr: usize = ptrace::read(pid, SHARED.del_pages_addr.as_ptr().cast())
                 .unwrap()
                 .cast_unsigned()
                 .try_into()
                 .unwrap();
             if del_pg_addr != 0 {
-                let del_pg_count: usize = ptrace::read(pid, DEL_PAGES_COUNT.as_ptr().cast())
+                let del_pg_count: usize = ptrace::read(pid, SHARED.del_pages_count.as_ptr().cast())
                     .unwrap()
                     .cast_unsigned()
                     .try_into()

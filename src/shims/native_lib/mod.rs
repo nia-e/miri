@@ -1,11 +1,8 @@
 //! Implements calling functions from a native library.
 
-use std::cell::Cell;
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::raw::c_void;
-use std::ptr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use libffi::low::CodePtr;
 use libffi::middle::Type as FfiType;
@@ -28,6 +25,10 @@ use crate::*;
     path = "trace/stub.rs"
 )]
 pub mod trace;
+
+/// A pointer to the `MiriInterpCx` for use within the libc shims. Since only
+/// one instance of Miri can be in FFI at any given time, this can be a static.
+static MACHINE_PTR: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// An argument for an FFI call.
 #[derive(Debug, Clone)]
@@ -54,7 +55,7 @@ pub struct MemEvents {
 }
 
 /// A single memory access.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum AccessEvent {
     /// A read occurred on this memory range.
     Read(AccessRange),
@@ -69,14 +70,21 @@ pub enum AccessEvent {
 impl AccessEvent {
     fn get_range(&self) -> AccessRange {
         match self {
-            AccessEvent::Read(access_range) => access_range.clone(),
-            AccessEvent::Write(access_range, _) => access_range.clone(),
+            AccessEvent::Read(access_range) | AccessEvent::Write(access_range, _) =>
+                access_range.clone(),
+        }
+    }
+
+    fn base_addr(&self) -> usize {
+        match self {
+            AccessEvent::Read(access_range) | AccessEvent::Write(access_range, _) =>
+                access_range.addr,
         }
     }
 }
 
 /// The memory touched by a given access.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AccessRange {
     /// The base address in memory where an access occurred.
     pub addr: usize,
@@ -108,21 +116,23 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
         //let alloc = ();
 
         // Expose InterpCx for use by closure callbacks.
-        this.machine.native_lib_ecx_interchange.set(ptr::from_mut(this).expose_provenance());
+        //this.machine.native_lib_ecx_interchange.set(ptr::from_mut(this).expose_provenance());
+        MACHINE_PTR.store(std::ptr::from_mut(this).cast(), Ordering::Release);
 
+        // We need to instantiate the return value outside of `do_ffi`, or else
+        // its allocation will be intercepted by the libc allocator shims.
+        let mut ret_data = vec![0u8; ret.1.bytes_usize()];
         let res = this.do_ffi(|| {
             use libffi::middle::{Arg, Cif, Ret};
 
             let cif = Cif::new(args.iter_mut().map(|arg| arg.ty.take().unwrap()), ret.0);
             let arg_ptrs: Vec<_> = args.iter().map(|arg| Arg::new(&*arg.bytes)).collect();
-            let mut ret = vec![0u8; ret.1.bytes_usize()];
 
-            unsafe { cif.call_return_into(fun, &arg_ptrs, Ret::new::<[u8]>(&mut *ret)) };
-            ret.into()
+            unsafe { cif.call_return_into(fun, &arg_ptrs, Ret::new::<[u8]>(&mut *ret_data)) };
+            ret_data.into()
         });
 
-        this.machine.native_lib_ecx_interchange.set(0);
-
+        MACHINE_PTR.store(std::ptr::null_mut(), Ordering::Release);
         res
     }
 
@@ -254,7 +264,7 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Helper to print a warning when a pointer is shared with the native code.
         let expose = |prov: Provenance| -> InterpResult<'tcx> {
             static DEDUP: AtomicBool = AtomicBool::new(false);
-            if !DEDUP.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if !DEDUP.swap(true, Ordering::Relaxed) {
                 // Newly set, so first time we get here.
                 this.emit_diagnostic(NonHaltingDiagnostic::NativeCallSharedMem { tracing });
             }
@@ -427,13 +437,6 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
     }
 }
 
-/// The data passed to the closure shim function used to intercept function pointer calls from
-/// native code.
-struct LibffiClosureData<'tcx> {
-    ecx_interchange: &'static Cell<usize>,
-    marker: PhantomData<MiriInterpCx<'tcx>>,
-}
-
 /// This function sets up a new libffi closure to intercept
 /// calls to rust code via function pointers passed to native code.
 ///
@@ -459,16 +462,13 @@ pub fn build_libffi_closure<'tcx, 'this>(
 
     // Build the actual closure.
     let closure_builder = libffi::middle::Builder::new().args(args).res(res_type);
-    let data = LibffiClosureData {
-        ecx_interchange: this.machine.native_lib_ecx_interchange,
-        marker: PhantomData,
-    };
-    let data = Box::leak(Box::new(data));
+    let data = Box::leak(Box::new(()));
     let closure = closure_builder.into_closure(libffi_closure_callback, data);
     let closure = Box::leak(Box::new(closure));
 
     // The actual argument/return type doesn't matter.
     let fn_ptr = unsafe { closure.instantiate_code_ptr::<unsafe extern "C" fn()>() };
+    //eprintln!("fn_ptr: {f:#0x?}", f = *fn_ptr);
     // Libffi returns a **reference** to a function ptr here.
     // Therefore we need to dereference the reference to get the actual function pointer.
     interp_ok(*fn_ptr)
@@ -479,19 +479,34 @@ pub fn build_libffi_closure<'tcx, 'this>(
 ///
 /// For now this shim only reports that such constructs are not supported by miri.
 /// As future improvement we might continue execution in the interpreter here.
-unsafe extern "C" fn libffi_closure_callback<'tcx>(
+unsafe extern "C" fn libffi_closure_callback(
     _cif: &libffi::low::ffi_cif,
     _result: &mut c_void,
     _args: *const *const c_void,
-    data: &LibffiClosureData<'tcx>,
+    _data: &(),
 ) {
     let ecx = unsafe {
-        ptr::with_exposed_provenance_mut::<MiriInterpCx<'tcx>>(data.ecx_interchange.get())
+        MACHINE_PTR
+            .load(Ordering::Acquire)
+            .cast::<MiriInterpCx<'_>>()
             .as_mut()
             .expect("libffi closure called while no FFI call is active")
     };
-    let err = err_unsup_format!("calling a function pointer through the FFI boundary");
+    if trace::Supervisor::is_enabled() {
+        // SAFETY: We set memory back to normal, so this is safe.
+        unsafe {
+            trace::Supervisor::protect_pages(
+                ecx.machine.allocator.as_ref().unwrap().borrow().pages(),
+                nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
+            )
+            .unwrap();
+        }
+        // Tell the supervisor process to fix up our libc handling; we can ignore whatever
+        // accesses it might otherwise report to us, since we're crashing anyway.
+        nix::sys::signal::raise(nix::sys::signal::SIGUSR1).unwrap();
+    }
 
+    let err = err_unsup_format!("calling a function pointer through the FFI boundary");
     crate::diagnostics::report_result(ecx, err.into());
     // We abort the execution at this point as we cannot return the
     // expected value here.
@@ -575,8 +590,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let (ret, maybe_memevents) =
             this.call_native_raw(code_ptr, &mut libffi_args, (ret_ty, dest.layout.size))?;
         if tracing {
-            let mm = maybe_memevents.unwrap();
-            this.tracing_apply_accesses(mm)?;
+            let events = maybe_memevents.unwrap();
+            this.tracing_apply_accesses(events)?;
         }
         this.ffi_ret_to_mem(ret, dest)?;
         interp_ok(true)
